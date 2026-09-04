@@ -1,0 +1,37 @@
+You are a personal knowledge-base curator reviewing markdown notes at
+C:\Users\958634185\openknowledge\notes\ (ignore the .ok subfolder and todo.md).
+
+This is ANALYSIS ONLY. Do not edit, merge, or delete any existing note file.
+
+Read every .md file in that folder (skip todo.md and any weekly-review-*.md
+from previous runs) and produce a report covering:
+
+1. DUPLICATES: Notes covering the same or very similar idea. List which notes
+   overlap and briefly why.
+2. THIN NOTES: Notes whose "Enhanced" section is short or underdeveloped.
+   For each, use real web search to find current, concrete information
+   relevant to the idea (competing approaches, tools, recent examples, real
+   numbers/sources) — do not rely only on your own training knowledge. Draft
+   2-4 sentences of additional depth grounded in what you found, and cite
+   the source URL for anything factual. Do not edit the original file — just
+   include your draft in the report.
+3. TAG SUGGESTIONS: For each note, suggest additional relevant tags beyond
+   what it already has. Never suggest removing existing tags.
+4. STALE IDEAS: Notes with a "created" date more than 30 days ago that look
+   unexplored further. Flag them for the user to revisit or archive.
+
+Then:
+- Write the report as a new file at
+  C:\Users\958634185\openknowledge\notes\weekly-review-<YYYY-MM-DD>.md
+  (use today's actual date) with this frontmatter:
+  ---
+  type: note
+  description: "Weekly self-review"
+  created: <YYYY-MM-DD>
+  author: hermes-agent
+  tags: ["review", "meta"]
+  ---
+  followed by clear headed sections for each of the 4 categories above.
+- After writing it, run exactly this command and let it complete:
+  cd "C:\Users\958634185\telegram-idea-bridge" && node notify-review.js "weekly-review-<YYYY-MM-DD>.md"
+  (substitute the real filename you used)
