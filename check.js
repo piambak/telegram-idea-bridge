@@ -1,7 +1,7 @@
 // Self-check for the routing layer. Run: node check.js
 // No framework — asserts only. Exits non-zero on failure.
 const assert = require('assert');
-const { MODELS, DEFAULT_MODEL, parseModelOverride } = require('./lib/models');
+const { MODELS, DEFAULT_MODEL, JOB_MODELS, modelForJob, parseModelOverride, makeOpenAICompatChat } = require('./lib/models');
 
 // --- model registry -------------------------------------------------------
 assert.ok(MODELS[DEFAULT_MODEL], `DEFAULT_MODEL "${DEFAULT_MODEL}" must exist in MODELS`);
@@ -37,4 +37,62 @@ for (const line of src.split('\n')) {
 }
 assert.deepStrictEqual(offenders, [], `unescaped non-HTML tags in sendMessage:\n${offenders.join('\n')}`);
 
-console.log('check.js: all assertions passed');
+// --- per-job model defaults (JOB_MODELS) ------------------------------
+for (const [job, alias] of Object.entries(JOB_MODELS)) {
+	assert.ok(MODELS[alias], `JOB_MODELS.${job} points at "${alias}", which is not a registered model`);
+}
+assert.strictEqual(modelForJob('regcheck'), 'ollamacloud', 'regcheck should use the steady single provider');
+assert.strictEqual(modelForJob('no-such-job'), DEFAULT_MODEL, 'unknown job falls back to the default');
+assert.strictEqual(modelForJob(undefined), DEFAULT_MODEL, 'missing job falls back to the default');
+// An explicit prefix must beat the per-job default, or overrides are useless.
+assert.strictEqual(parseModelOverride('openrouter: x', 'regcheck').modelKey, 'openrouter');
+assert.strictEqual(parseModelOverride('plain text', 'regcheck').modelKey, 'ollamacloud');
+
+// --- retry classification --------------------------------------------
+// Retrying a 401 just delays a clear error; not retrying a 503 loses a
+// job to a transient blip. Both directions matter, so both are asserted
+// against a local fake server in the async block below.
+const http = require('http');
+(async () => {
+	const { env } = require('./lib/config');
+	env.__CHECK_KEY = 'testkey';
+	const hits = { flaky: 0, auth: 0 };
+	const srv = http.createServer((req, res) => {
+		if (req.url.includes('flaky')) {
+			hits.flaky++;
+			if (hits.flaky < 3) {
+				res.writeHead(503);
+				return res.end('high demand');
+			}
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			return res.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }));
+		}
+		hits.auth++;
+		res.writeHead(401);
+		res.end('invalid api key');
+	});
+	await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+	const base = `http://127.0.0.1:${srv.address().port}`;
+	const opts = { model: 'm', apiKeyEnv: '__CHECK_KEY' };
+	const flaky = makeOpenAICompatChat({ baseUrl: base + '/flaky', ...opts });
+	const auth = makeOpenAICompatChat({ baseUrl: base + '/auth', ...opts });
+
+	assert.strictEqual(await flaky([{ role: 'user', content: 'hi' }]), 'ok');
+	assert.strictEqual(hits.flaky, 3, `503 should be retried twice then succeed (got ${hits.flaky})`);
+	await assert.rejects(() => auth([{ role: 'user', content: 'hi' }]), /401/);
+	assert.strictEqual(hits.auth, 1, `401 must not be retried (got ${hits.auth})`);
+	srv.close();
+
+	// --- scraper breakage is distinguishable from quiet news -------------
+	const regmonitor = require('./lib/regmonitor');
+	const realFetch = global.fetch;
+	global.fetch = async () => ({ ok: true, status: 200, text: async () => '<html><body>redesigned</body></html>' });
+	await assert.rejects(
+		() => regmonitor.fetchLatest(),
+		(e) => e.name === 'ScrapeError',
+		'a 200 response matching nothing must raise ScrapeError, not look like an empty result',
+	);
+	global.fetch = realFetch;
+
+	console.log('check.js: all assertions passed');
+})();

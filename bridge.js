@@ -19,7 +19,7 @@ const regmonitor = require('./lib/regmonitor');
 const images = require('./lib/images');
 const vaultsync = require('./lib/vaultsync');
 const os = require('os');
-const { MODELS, DEFAULT_MODEL, parseModelOverride } = require('./lib/models');
+const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
 const BOT_COMMANDS = [
 	{ command: 'start', description: 'Show what this bot does' },
@@ -28,10 +28,12 @@ const BOT_COMMANDS = [
 	{ command: 'get', description: 'Open a result by number: /get <n>' },
 	{ command: 'pdf', description: 'Capture a PDF: /pdf <link or title>' },
 	{ command: 'calc', description: 'Calculate: /calc <expr or word problem>, or send a photo' },
+	{ command: 'summarize', description: 'Summarize text or a vault note: /summarize <text | note n>' },
 	{ command: 'news', description: 'News digest: /news <topic>' },
 	{ command: 'schedule', description: 'Add to calendar: /schedule <freeform event text>' },
 	{ command: 'doc', description: 'Draft a Word doc: /doc <template or "default"> | <brief>' },
 	{ command: 'excel', description: 'Draft an Excel table: /excel <template or "default"> | <brief>' },
+	{ command: 'templates', description: 'List your .docx/.xlsx templates and their placeholders' },
 	{ command: 'regcheck', description: 'Check now for new Kemenkeu/DJP regulations' },
 	{ command: 'banner', description: 'Sample images for a banner: /banner <keyword>' },
 	{ command: 'grammar', description: 'Fix grammar: /grammar <text>' },
@@ -164,12 +166,18 @@ async function handleSend(chatId) {
 	}
 }
 
+// The numbers in a /todo list are positions, and completing an item
+// renumbers everything below it. Remembering what was actually shown lets
+// "done 2" close the item the user read as 2, even if the list moved since.
+const lastTodoListing = new Map();
+
 async function handleTodo(chatId, arg) {
 	const [sub, ...restParts] = arg.split(/\s+/);
 	const rest = restParts.join(' ').trim();
 
 	if (arg === 'list' || arg === '') {
 		const items = todo.listItems();
+		lastTodoListing.set(chatId, items.map((it) => it.text));
 		if (items.length === 0) {
 			await telegram.sendMessage(chatId, 'No open to-dos. Add one: /todo &lt;item&gt;');
 			return;
@@ -180,12 +188,21 @@ async function handleTodo(chatId, arg) {
 	}
 	if (sub === 'done') {
 		const n = Number(rest);
+		if (!Number.isInteger(n) || n < 1) {
+			await telegram.sendMessage(chatId, 'Usage: /todo done &lt;n&gt; — the number from /todo list.');
+			return;
+		}
 		try {
-			const text = todo.markDone(n);
+			// Prefer the text the user actually saw; fall back to positional
+			// only when there is no remembered listing (e.g. after a restart).
+			const remembered = lastTodoListing.get(chatId);
+			const expected = remembered && remembered[n - 1];
+			const text = expected ? todo.markDoneMatching(expected) : todo.markDone(n);
+			lastTodoListing.delete(chatId); // positions just shifted; force a re-list
 			await syncVaultQuietly(`Todo done: ${text}`);
 			await telegram.sendMessage(chatId, `✅ Done: ${escapeHtml(text)}`);
 		} catch (err) {
-			await telegram.sendMessage(chatId, err.message);
+			await telegram.sendMessage(chatId, escapeHtml(err.message) + '\n\nRun /todo list to see current numbers.');
 		}
 		return;
 	}
@@ -226,6 +243,65 @@ async function handleCalcImage(chatId, fileId) {
 		await telegram.sendMessage(chatId, `Calculation failed: ${escapeHtml(err.message)}`);
 	} finally {
 		if (imagePath) fs.unlink(imagePath, () => {});
+		stopTyping();
+	}
+}
+
+// Ad-hoc summarization of text pasted straight into Telegram, or of a note
+// already in the vault ("/summarize note <n>" after /list or /search).
+// lib/summarize picks the engine by length on its own: long documents go to
+// the Claude CLI, short ones to the fast model.
+async function handleSummarize(chatId, argText) {
+	if (!argText) {
+		await telegram.sendMessage(
+			chatId,
+			'Usage: /summarize &lt;text&gt;\nOr summarize a vault entry: /summarize note &lt;n&gt; (after /list or /search)',
+		);
+		return;
+	}
+
+	const { modelKey, rest } = parseModelOverride(argText, 'summarize');
+	const model = MODELS[modelKey];
+
+	// "note <n>" resolves against the last /list or /search results.
+	let text = rest;
+	let sourceLabel = null;
+	const noteMatch = rest.match(/^note\s+(\d+)$/i);
+	if (noteMatch) {
+		const results = lastResults.get(chatId);
+		const n = Number(noteMatch[1]);
+		if (!results || n < 1 || n > results.length) {
+			await telegram.sendMessage(chatId, 'Run /list or /search first, then /summarize note &lt;n&gt; with a valid number.');
+			return;
+		}
+		const target = results[n - 1];
+		try {
+			text = vault.readNote(target.path);
+			sourceLabel = target.path;
+		} catch (err) {
+			await telegram.sendMessage(chatId, `Couldn't open that entry: ${escapeHtml(err.message)}`);
+			return;
+		}
+	}
+
+	if (text.trim().length < 200) {
+		await telegram.sendMessage(chatId, 'That is already short enough to read as-is - send at least a couple of paragraphs.');
+		return;
+	}
+
+	const usingClaude = text.length > summarize.CLAUDE_LENGTH_THRESHOLD;
+	const where = sourceLabel ? `<b>${escapeHtml(sourceLabel)}</b> ` : '';
+	await telegram.sendMessage(
+		chatId,
+		`Summarizing ${where}(${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`,
+	);
+	startTyping(chatId);
+	try {
+		const summary = await summarize.summarize(text, model.chat);
+		await telegram.sendMessage(chatId, escapeHtml(summary));
+	} catch (err) {
+		await telegram.sendMessage(chatId, `Summarize failed: ${escapeHtml(err.message)}`);
+	} finally {
 		stopTyping();
 	}
 }
@@ -364,10 +440,33 @@ async function runRegulationCheck(chatId, { announceNoChange = false, modelKey =
 	);
 }
 
+async function handleTemplates(chatId) {
+	try {
+		const items = await docgen.listTemplates();
+		if (items.length === 0) {
+			await telegram.sendMessage(chatId, 'No templates yet. Drop .docx / .xlsx files into the OneDrive folder: Bot Templates');
+			return;
+		}
+		const lines = items.map((it) => {
+			const name = escapeHtml(path.basename(it.file, it.ext));
+			const head = `\u{1F4C4} <b>${name}</b> (${it.ext.slice(1)})`;
+			if (it.tags === null) return `${head}\n   ⚠️ could not be read`;
+			if (it.tags.length === 0) return `${head}\n   no {placeholders} — will be copied unchanged`;
+			return `${head}\n   fills: ${it.tags.map((t) => escapeHtml('{' + t + '}')).join(', ')}`;
+		});
+		await telegram.sendMessage(
+			chatId,
+			`<b>Your templates</b> (OneDrive → Bot Templates)\n\n${lines.join('\n\n')}\n\nUse one: /doc &lt;part of the name&gt; | &lt;brief&gt;\nPut {title} {content} {date} {author} in the file where text should go.`,
+		);
+	} catch (err) {
+		await telegram.sendMessage(chatId, `Could not list templates: ${escapeHtml(err.message)}`);
+	}
+}
+
 async function handleRegcheck(chatId, modelKeyArg) {
 	startTyping(chatId);
 	try {
-		await runRegulationCheck(chatId, { announceNoChange: true, modelKey: MODELS[modelKeyArg] ? modelKeyArg : undefined });
+		await runRegulationCheck(chatId, { announceNoChange: true, modelKey: MODELS[modelKeyArg] ? modelKeyArg : modelForJob('regcheck') });
 	} catch (err) {
 		await telegram.sendMessage(chatId, `Regulation check failed: ${escapeHtml(err.message)}`);
 	} finally {
@@ -380,7 +479,7 @@ async function handleBanner(chatId, rawKeyword) {
 		await telegram.sendMessage(chatId, 'Usage: /banner &lt;keyword&gt;, e.g. /banner office christmas celebration');
 		return;
 	}
-	const { modelKey, rest: keyword } = parseModelOverride(rawKeyword);
+	const { modelKey, rest: keyword } = parseModelOverride(rawKeyword, 'banner');
 	const model = MODELS[modelKey];
 	startTyping(chatId);
 	try {
@@ -523,10 +622,12 @@ const HELP_TEXT = [
 	'/broadcast &lt;brief&gt; — draft a WhatsApp broadcast, then /send to actually post it',
 	'/todo &lt;item&gt; / /todo list / /todo done &lt;n&gt; — quick to-do list',
 	'/calc &lt;expr or word problem&gt; — calculate (or send a photo of a problem)',
+	'/summarize &lt;text&gt; — summarize pasted text, or /summarize note &lt;n&gt; for a vault entry',
 	'/news &lt;topic&gt; — recent news digest',
 	'/schedule &lt;event text&gt; — generate a .ics calendar file',
 	'/doc &lt;template or &quot;default&quot;&gt; | &lt;brief&gt; — draft a Word doc into OneDrive',
 	'/excel &lt;template or &quot;default&quot;&gt; | &lt;brief&gt; — draft an Excel table into OneDrive',
+	'/templates — list your Word/Excel templates and the placeholders each one fills',
 	'/regcheck — check now for new Kemenkeu regulations (auto-checked daily at 07:00 WIB)',
 	'/banner &lt;keyword&gt; — sample stock images for a banner/design idea',
 	'/models — list available models and overrides',
@@ -545,6 +646,27 @@ function enqueue(task) {
 		.catch((err) => console.error('[bridge] task error:', err));
 }
 
+// Tapping a command in Telegram's menu sends a bare "/cmd" with no argument.
+// Instead of answering with a usage line, remember the command and treat the
+// next plain message as its argument — click the menu, then just type the text.
+const ARG_PROMPTS = {
+	'/search': 'What should I search the vault for?',
+	'/get': 'Which result number? (from the last /list or /search)',
+	'/pdf': 'Send the PDF link or the document title.',
+	'/grammar': 'Send the text to fix.',
+	'/promptgen': 'What is the goal of the prompt?',
+	'/broadcast': 'Send the brief for the WhatsApp broadcast.',
+	'/calc': 'Send the expression or word problem — or a photo of it.',
+	'/summarize': 'Send the text to summarize, or "note &lt;n&gt;" for a vault entry.',
+	'/news': 'Which topic?',
+	'/schedule': 'Describe the event, e.g. "meeting with tax team tomorrow 2pm at room 305".',
+	'/doc': 'Send: &lt;template name or "default"&gt; | &lt;brief&gt;',
+	'/excel': 'Send: &lt;template name or "default"&gt; | &lt;brief&gt;',
+	'/banner': 'Which keyword? e.g. office christmas celebration',
+};
+
+const pendingCommand = new Map();
+
 async function handleMessage(message) {
 	const chatId = message.chat.id;
 	if (chatId !== allowedChatId) return;
@@ -552,13 +674,26 @@ async function handleMessage(message) {
 	if (message.photo && message.photo.length > 0) {
 		const caption = (message.caption || '').trim();
 		if (caption && !caption.startsWith('/calc')) return; // photo for some other purpose, ignore
+		pendingCommand.delete(chatId);
 		const largest = message.photo[message.photo.length - 1];
 		enqueue(() => handleCalcImage(chatId, largest.file_id));
 		return;
 	}
 
-	const text = (message.text || '').trim();
+	let text = (message.text || '').trim();
 	if (!text) return;
+
+	if (ARG_PROMPTS[text]) {
+		pendingCommand.set(chatId, text);
+		await telegram.sendMessage(chatId, ARG_PROMPTS[text], { reply_markup: { force_reply: true, selective: true } });
+		return;
+	}
+	if (text.startsWith('/')) {
+		pendingCommand.delete(chatId); // a new command cancels a pending prompt
+	} else if (pendingCommand.has(chatId)) {
+		text = `${pendingCommand.get(chatId)} ${text}`;
+		pendingCommand.delete(chatId);
+	}
 
 	if (text === '/start' || text === '/help') {
 		await telegram.sendMessage(chatId, HELP_TEXT);
@@ -578,6 +713,10 @@ async function handleMessage(message) {
 	}
 	if (text.startsWith('/pdf')) {
 		enqueue(() => handlePdf(chatId, text.slice(4).trim()));
+		return;
+	}
+	if (text === '/templates') {
+		enqueue(() => handleTemplates(chatId));
 		return;
 	}
 	if (text === '/models') {
@@ -618,6 +757,10 @@ async function handleMessage(message) {
 	}
 	if (text.startsWith('/calc')) {
 		enqueue(() => handleCalc(chatId, text.slice('/calc'.length).trim()));
+		return;
+	}
+	if (text.startsWith('/summarize')) {
+		enqueue(() => handleSummarize(chatId, text.slice('/summarize'.length).trim()));
 		return;
 	}
 	if (text.startsWith('/news')) {
@@ -676,9 +819,24 @@ async function pollLoop() {
 	}
 }
 
-regmonitor.scheduleDaily(7, () =>
-	enqueue(() => runRegulationCheck(allowedChatId, { announceNoChange: false, modelKey: 'ollamacloud' })),
-);
-console.log('[bridge] regulation monitor scheduled for 07:00 WIB daily');
+module.exports = { handleMessage, pendingCommand };
 
-pollLoop();
+if (require.main === module) {
+	// The daily run is unattended, so its failures must reach Telegram rather
+	// than only the log - a broken scraper otherwise looks exactly like a quiet
+	// news day. enqueue() swallows errors by design, so catch before it does.
+	regmonitor.scheduleDaily(7, () =>
+		enqueue(() =>
+			runRegulationCheck(allowedChatId, { announceNoChange: false, modelKey: modelForJob('regcheck') }).catch((err) => {
+				const prefix =
+					err.name === 'ScrapeError'
+						? '\u{1F527} <b>Regulation scraper is broken</b>'
+						: '\u26A0\uFE0F <b>Daily regulation check failed</b>';
+				return telegram.sendMessage(allowedChatId, prefix + '\n\n' + escapeHtml(err.message)).catch(() => {});
+			}),
+		),
+	);
+	console.log('[bridge] regulation monitor scheduled for 07:00 WIB daily');
+
+	pollLoop();
+}

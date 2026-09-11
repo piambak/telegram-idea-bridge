@@ -3,4 +3,5 @@ node_modules/
 
 # runtime state — changes on every run, no value in history
 *.log
+*.log.new
 .offset
