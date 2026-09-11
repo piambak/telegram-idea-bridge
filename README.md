@@ -17,7 +17,7 @@ commands.
 | `/calc <expr or word problem>` | Calculate (text or a photo of the problem) |
 | `/summarize <text \| note n>` | Summarize text or a vault note |
 | `/news <topic>` | News digest |
-| `/schedule <freeform event text>` | Add an event to Google Calendar |
+| `/schedule <freeform event text>` | Add an event to your calendar (Radicale/CalDAV) and send a `.ics` file |
 | `/doc <template or "default"> \| <brief>` | Draft a Word document |
 | `/excel <template or "default"> \| <brief>` | Draft an Excel table |
 | `/templates` | List your `.docx`/`.xlsx` templates and their placeholders |
@@ -52,14 +52,22 @@ OLLAMA_CLOUD_API_KEY=
 OPENROUTER_API_KEY=
 PEXELS_API_KEY=
 
-GOOGLE_CALENDAR_ID=
-GOOGLE_CALENDAR_CLIENT_ID=
-GOOGLE_CALENDAR_CLIENT_SECRET=
-GOOGLE_CALENDAR_REFRESH_TOKEN=
+RADICALE_URL=
+RADICALE_USER=
+RADICALE_PASSWORD=
+RADICALE_CALENDAR=
 ```
 
-`TELEGRAM_ALLOWED_CHAT_ID` restricts the bot to a single chat. Google
-Calendar credentials can be generated with `reauth-google-calendar.js`.
+`TELEGRAM_ALLOWED_CHAT_ID` restricts the bot to a single chat.
+
+`/schedule` pushes events to a local [Radicale](https://radicale.org/)
+CalDAV server rather than Google Calendar — no OAuth, no 7-day token
+expiry. Radicale itself lives outside this repo (`~/radicale`, a Python
+venv + config, autostarted via a Startup-folder script) and is treated as
+a cross-project dependency, the same way `lib/whatsapp.js` talks to the
+separate hermes WhatsApp bridge process. If `/schedule` fails to add to
+the calendar, that process needs restarting; the `.ics` file it also
+sends still works standalone in any calendar app.
 
 ## Running
 

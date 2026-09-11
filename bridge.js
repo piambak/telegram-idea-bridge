@@ -12,7 +12,7 @@ const calc = require('./lib/calc');
 const summarize = require('./lib/summarize');
 const news = require('./lib/news');
 const schedule = require('./lib/schedule');
-const googlecalendar = require('./lib/googlecalendar');
+const radicale = require('./lib/radicale');
 const whatsapp = require('./lib/whatsapp');
 const docgen = require('./lib/docgen');
 const regmonitor = require('./lib/regmonitor');
@@ -343,15 +343,17 @@ async function handleSchedule(chatId, rawText) {
 	try {
 		const event = await schedule.parseEvent(rest, model.chat);
 
+		const ics = schedule.buildIcs(event);
+		const uid = (ics.match(/^UID:(.+)$/m) || [])[1];
+
 		let calendarLine = '';
 		try {
-			const { eventUrl } = await googlecalendar.createEvent(event);
-			calendarLine = `\n\n✅ Added to Google Calendar: ${escapeHtml(eventUrl)}`;
+			await radicale.pushEvent(uid, ics);
+			calendarLine = '\n\n✅ Added to your calendar.';
 		} catch (err) {
-			calendarLine = `\n\n⚠️ Couldn't add to Google Calendar (${escapeHtml(err.message)}) — use the file below instead.`;
+			calendarLine = `\n\n⚠️ Couldn't add to your calendar (${escapeHtml(err.message)}) — use the file below instead.`;
 		}
 
-		const ics = schedule.buildIcs(event);
 		const filename = `${event.title.replace(/[^\w-]+/g, '_').slice(0, 40) || 'event'}.ics`;
 		await telegram.sendDocument(
 			chatId,
