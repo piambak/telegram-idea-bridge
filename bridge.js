@@ -86,11 +86,14 @@ async function handleIdea(chatId, rawText) {
 	try {
 		const { title, tags, body } = await enhance.enhanceIdea(rest, model.chat);
 		const filePath = knowledge.writeIdeaNote({ title, tags, rawIdea: rest, enhancedBody: body });
-		await syncVaultQuietly(`Add idea: ${title}`);
 		await telegram.sendMessage(
 			chatId,
 			`<b>${escapeHtml(title)}</b>\n\n${escapeHtml(body)}\n\n💾 Saved to notes/${path.basename(filePath)}`,
 		);
+		// Fire-and-forget: the note is already saved locally, so a slow (or
+		// failing) push must never delay or fail the reply (docs/ANALYSIS.md
+		// bug #5). syncVaultQuietly itself never rejects.
+		syncVaultQuietly(`Add idea: ${title}`);
 	} catch (err) {
 		await telegram.sendMessage(chatId, `Enhancement failed: ${escapeHtml(err.message)}`);
 	} finally {
@@ -818,7 +821,7 @@ async function pollLoop() {
 	}
 }
 
-module.exports = { handleMessage, pendingCommand };
+module.exports = { handleMessage, pendingCommand, syncVaultQuietly };
 
 if (require.main === module) {
 	// One-time migration of pre-.state/ files (bug #7: seen-regulations.json
