@@ -504,6 +504,11 @@ async function handleSpendDiscard(chatId, messageId) {
 // Batal, so the user can tap around before committing.
 async function handleSpendCategory(chatId, messageId, entry, category, id) {
 	if (!finance.CATEGORIES.includes(category)) return { removePending: false };
+	// Tapping the already-selected category (e.g. the one txn-extract or
+	// receipt-vision already guessed) would produce byte-identical card
+	// content — Telegram's editMessageText rejects a no-op edit outright, so
+	// skip the call entirely rather than let that surface as an error.
+	if (entry.data.txn.category === category) return { removePending: false };
 	const txn = { ...entry.data.txn, category };
 	pending.update(id, { txn });
 	await telegram.editMessageText(chatId, messageId, spendCardHtml(txn), { reply_markup: spendKeyboard(id) });
@@ -1421,6 +1426,16 @@ async function handleCallbackQuery(cq) {
 		if (!result || result.removePending !== false) pending.remove(id);
 		await telegram.answerCallbackQuery(cq.id);
 	} catch (err) {
+		// Telegram rejects an editMessageText call whose new content/keyboard
+		// is byte-identical to what's already shown — every button handler in
+		// the bot edits a message this way, so this can surface from any of
+		// them (a double-tap, or picking the option that's already selected),
+		// not just the one that prompted adding this check. It means nothing
+		// actually failed: the message already shows the right thing.
+		if (/message is not modified/i.test(err.message)) {
+			await telegram.answerCallbackQuery(cq.id).catch(() => {});
+			return;
+		}
 		console.error('[bridge] callback query failed:', err.message);
 		pending.remove(id);
 		await telegram.editMessageText(chatId, messageId, `⚠️ ${escapeHtml(err.message)}`).catch(() => {});

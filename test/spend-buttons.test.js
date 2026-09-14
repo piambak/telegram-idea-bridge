@@ -141,6 +141,56 @@ test('tapping a category button updates the card and keeps the draft alive for a
 	assert.strictEqual(appended[0].row[2], 'Transport', 'the recategorized value must be what gets logged');
 });
 
+test('tapping the already-selected category is a no-op — no Telegram edit call, draft stays intact for Simpan', async (t) => {
+	appended.length = 0;
+	events.length = 0;
+
+	await handleMessage(msg('/spend makan siang 45rb'));
+	await tick();
+	const draftMsg = events.at(-1);
+	// The model stub already categorized this "Makan" — tap that same button.
+	const makanButton = draftMsg.extra.reply_markup.inline_keyboard[1][0];
+	assert.strictEqual(makanButton.text, 'Makan');
+
+	t.mock.method(telegram, 'editMessageText', async () => {
+		throw new Error('must not call editMessageText for a no-op category re-selection');
+	});
+	events.length = 0;
+	await handleCallbackQuery({ id: 'cq5', data: makanButton.callback_data, message: { chat: { id: allowedChatId }, message_id: draftMsg.message_id } });
+	await tick();
+	assert.strictEqual(events.length, 0, 'no edit should have been attempted at all');
+	t.mock.restoreAll(); // back to the working editMessageText stub from the top of this file
+
+	// The draft must still be usable afterward.
+	const saveButton = draftMsg.extra.reply_markup.inline_keyboard[0][0];
+	await handleCallbackQuery({ id: 'cq6', data: saveButton.callback_data, message: { chat: { id: allowedChatId }, message_id: draftMsg.message_id } });
+	await tick();
+	assert.strictEqual(appended.length, 1, 'the draft must not have been silently discarded');
+	assert.strictEqual(appended[0].row[2], 'Makan');
+});
+
+test('handleCallbackQuery treats Telegram\'s "message is not modified" as benign — no error card, draft survives', async (t) => {
+	appended.length = 0;
+	events.length = 0;
+
+	await handleMessage(msg('/spend makan siang 45rb'));
+	await tick();
+	const draftMsg = events.at(-1);
+	const discardButton = draftMsg.extra.reply_markup.inline_keyboard[0][1];
+
+	t.mock.method(telegram, 'editMessageText', async () => {
+		throw new Error('Telegram editMessageText failed: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message');
+	});
+	events.length = 0;
+	await handleCallbackQuery({ id: 'cq7', data: discardButton.callback_data, message: { chat: { id: allowedChatId }, message_id: draftMsg.message_id } });
+	await tick();
+
+	assert.strictEqual(events.length, 0, 'no error card should be shown for a benign "not modified" rejection');
+	const pending = require('../lib/pending');
+	const pendingId = discardButton.callback_data.split(':')[1];
+	assert.ok(pending.get(pendingId), 'the draft must not be dropped just because the edit was a no-op');
+});
+
 test('a photo captioned /spend goes straight to the receipt confirm card, skipping the "what is this for?" prompt', async (t) => {
 	appended.length = 0;
 	events.length = 0;
