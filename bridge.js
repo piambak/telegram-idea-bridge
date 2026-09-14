@@ -23,6 +23,7 @@ const ui = require('./lib/ui');
 const pending = require('./lib/pending');
 const voice = require('./lib/voice');
 const finance = require('./lib/finance');
+const reminders = require('./lib/reminders');
 const os = require('os');
 const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
@@ -53,6 +54,7 @@ const BOT_COMMANDS = [
 	{ command: 'todo', description: '☑️ Daftar tugas: /todo <item>, /todo list' },
 	{ command: 'spend', description: '💸 Catat transaksi: /spend <deskripsi + jumlah>' },
 	{ command: 'report', description: '📊 Laporan keuangan: /report atau /report YYYY-MM' },
+	{ command: 'remind', description: '🔔 Pengingat: /remind <teks>, list, done <n>, del <n>, check' },
 	{ command: 'models', description: '🤖 Daftar model AI yang tersedia' },
 	{ command: 'help', description: '❓ Daftar lengkap perintah' },
 ];
@@ -546,6 +548,128 @@ async function handleReportPrevButton(chatId, messageId, entry) {
 	const html = await reportCardHtml(monthKey, model);
 	const id = pending.create('report', { monthKey });
 	await telegram.editMessageText(chatId, messageId, html, { reply_markup: reportKeyboard(id) });
+}
+
+// ---- Reminders (docs/V2-SPEC.md §4) --------------------------------------
+
+function reminderCardHtml(r, { justCompleted } = {}) {
+	const todayStr = reminders.todayWib();
+	const status = justCompleted
+		? '✅ Selesai'
+		: r.nextDue < todayStr
+			? `⚠️ Terlambat — jatuh tempo ${r.nextDue}`
+			: r.nextDue === todayStr
+				? '📅 Jatuh tempo hari ini'
+				: `📅 Jatuh tempo ${r.nextDue}`;
+	return ui.card({ icon: '🔔', title: r.title, subtitle: status, footer: r.notes || undefined });
+}
+
+function reminderKeyboard(pendingId) {
+	return ui.keyboard([[{ text: '✅ Selesai', callback_data: `reminddone:${pendingId}` }]]);
+}
+
+// A short human line for a rule string, e.g. "setiap tanggal 20" — used in
+// /remind list and the just-added confirmation; not worth a model call.
+const WEEKDAY_LABELS_ID = ['', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
+function reminderRuleLabel(rule) {
+	const parsed = reminders.parseRule(rule);
+	if (parsed.type === 'monthly') return `setiap tanggal ${parsed.day}`;
+	if (parsed.type === 'weekly') return `setiap ${WEEKDAY_LABELS_ID[parsed.weekday]}`;
+	if (parsed.type === 'yearly') return `setiap ${parsed.day}/${parsed.month}`;
+	return `sekali, ${parsed.date}`;
+}
+
+// Runs one tick and sends a fresh card (with a ✅ Selesai button) for every
+// nudge it returns — shared by the scheduled 07:15 WIB job and /remind
+// check running the same thing on demand. Each nudge gets its own pending
+// entry: yesterday's button (if any) has its own now-stale one, and a
+// fresh id per send matches the rest of the bot's button convention.
+async function runReminderTick() {
+	const nudges = await reminders.tick();
+	for (const { reminder } of nudges) {
+		const id = pending.create('reminder', { reminderId: reminder.id });
+		await ui.send(allowedChatId, reminderCardHtml(reminder), { reply_markup: reminderKeyboard(id) });
+	}
+	return nudges;
+}
+
+// [✅ Selesai] — the same rollover an external (phone) completion gets via
+// the daily tick, plus actually checking the Google Task off.
+async function handleReminderDoneButton(chatId, messageId, entry) {
+	const r = await reminders.markDone(entry.data.reminderId);
+	await telegram.editMessageText(chatId, messageId, reminderCardHtml(r, { justCompleted: true }));
+}
+
+// /remind <text> adds a reminder; list/done <n>/del <n>/check are
+// subcommands, where <n> is the position in reminders.listReminders()'s
+// fixed (soonest-due-first) order — the same "just re-list before acting on
+// a number" convention /todo uses.
+async function handleRemind(chatId, argText) {
+	const [sub, ...restParts] = argText.split(/\s+/);
+	const subRest = restParts.join(' ').trim();
+
+	if (argText === '' || argText === 'list') {
+		const list = reminders.listReminders();
+		if (list.length === 0) {
+			await ui.send(chatId, 'Belum ada pengingat. /remind &lt;deskripsi&gt; untuk menambah.');
+			return;
+		}
+		const items = list.map((r, i) => `${i + 1}. ${r.title} — ${reminderRuleLabel(r.rule)}, jatuh tempo ${r.nextDue} (H-${r.leadDays})`);
+		await ui.send(chatId, ui.card({ icon: '🔔', title: 'Pengingat', sections: [{ items }] }));
+		return;
+	}
+
+	if (sub === 'done' || sub === 'del') {
+		const n = Number(subRest);
+		if (!Number.isInteger(n) || n < 1) {
+			await ui.send(chatId, `Usage: /remind ${sub} &lt;n&gt; — the number from /remind list.`);
+			return;
+		}
+		const target = reminders.listReminders()[n - 1];
+		if (!target) {
+			await ui.send(chatId, 'Nomor itu tidak ada di /remind list saat ini.');
+			return;
+		}
+		try {
+			if (sub === 'done') {
+				const r = await reminders.markDone(target.id);
+				const nextLine = r.active ? `Berikutnya: ${r.nextDue}.` : '(sekali saja, tidak berulang lagi.)';
+				await ui.send(chatId, `✅ ${escapeHtml(r.title)} — ${nextLine}`);
+			} else {
+				reminders.removeReminder(target.id);
+				await ui.send(chatId, `🗑 Dihapus: ${escapeHtml(target.title)}`);
+			}
+		} catch (err) {
+			await ui.send(chatId, escapeHtml(err.message));
+		}
+		return;
+	}
+
+	if (argText === 'check') {
+		const job = await ui.progress(chatId, '⏳ Mengecek pengingat...');
+		try {
+			const nudges = await runReminderTick();
+			await job.finish(nudges.length === 0 ? 'Tidak ada pengingat yang perlu dikirim hari ini.' : `${nudges.length} pengingat dikirim.`);
+		} catch (err) {
+			await job.finish(`Gagal mengecek pengingat: ${escapeHtml(err.message)}`);
+		}
+		return;
+	}
+
+	const { modelKey, rest: text } = parseModelOverride(argText);
+	const model = MODELS[modelKey];
+	const job = await ui.progress(chatId, '⏳ Menambahkan pengingat...');
+	startTyping(chatId);
+	try {
+		const r = await reminders.addReminder(text, model.chat);
+		await job.finish(
+			ui.card({ icon: '🔔', title: r.title, subtitle: `${reminderRuleLabel(r.rule)} · H-${r.leadDays}`, footer: `Jatuh tempo berikutnya: ${r.nextDue}` }),
+		);
+	} catch (err) {
+		await job.finish(`Gagal menambahkan pengingat: ${escapeHtml(err.message)}`);
+	} finally {
+		stopTyping();
+	}
 }
 
 // Voice note -> Groq Whisper -> handled exactly like typed text (an idea or
@@ -1069,6 +1193,7 @@ async function handleStart(chatId) {
 			},
 			{ label: '🗓 Jadwal & dokumen', items: ['/schedule — tambah ke kalender', '/doc, /excel — buat dokumen', '/templates — lihat template'] },
 			{ label: '💸 Keuangan', items: ['/spend — catat transaksi (teks atau foto struk)', '/report — laporan bulanan'] },
+			{ label: '🔔 Pengingat', items: ['/remind — tambah pengingat berulang', '/remind list, done, del, check'] },
 			{ label: '🧮 Lainnya', items: ['/calc — hitung (teks atau foto)', '/news, /regcheck, /banner', '/broadcast, /todo, /grammar, /promptgen'] },
 		],
 		footer: '/help untuk daftar lengkap perintah',
@@ -1103,6 +1228,7 @@ const HELP_TEXT = [
 	'/banner &lt;keyword&gt; — sample stock images for a banner/design idea',
 	'/spend &lt;description + amount&gt; — log a transaction (or send a receipt photo), pick a category, confirm',
 	'/report or /report YYYY-MM — income/expense/net for a month (auto-sent on the 1st at 08:00 WIB for the previous month)',
+	'/remind &lt;text&gt; — add a recurring reminder; /remind list, done &lt;n&gt;, del &lt;n&gt;, check (checked automatically daily at 07:15 WIB)',
 	'/models — list available models and overrides',
 	'/help — this message',
 ].join('\n');
@@ -1136,6 +1262,7 @@ const CALLBACK_ACTIONS = {
 	spenddiscard: handleSpendDiscard,
 	spendcat: handleSpendCategory,
 	reportprev: handleReportPrevButton,
+	reminddone: handleReminderDoneButton,
 };
 
 // callback_data is "<action>:<pendingId>" or, for a few actions (the
@@ -1188,6 +1315,7 @@ const ARG_PROMPTS = {
 	'/excel': 'Send: &lt;template name or "default"&gt; | &lt;brief&gt;',
 	'/banner': 'Which keyword? e.g. office christmas celebration',
 	'/spend': 'Describe the transaction, e.g. "makan siang 45rb".',
+	'/remind': 'Describe the reminder, e.g. "bayar listrik setiap tanggal 20, ingatkan 3 hari sebelumnya".',
 };
 
 const pendingCommand = new Map();
@@ -1363,6 +1491,10 @@ function routeText(chatId, text) {
 		enqueue(() => handleReport(chatId, text.slice('/report'.length).trim()));
 		return;
 	}
+	if (text.startsWith('/remind')) {
+		enqueue(() => handleRemind(chatId, text.slice('/remind'.length).trim()));
+		return;
+	}
 	if (text.startsWith('/')) {
 		enqueue(() => ui.send(chatId, `Unknown command. ${HELP_TEXT}`));
 		return;
@@ -1439,6 +1571,16 @@ if (require.main === module) {
 		}),
 	);
 	console.log('[bridge] monthly finance report scheduled for the 1st at 08:00 WIB');
+
+	// Daily 07:15 WIB: create Google Tasks for reminders entering their lead
+	// window, nudge due/overdue ones, and detect phone-side completions
+	// (docs/V2-SPEC.md §4).
+	reminders.scheduleDailyTick(7, 15, () =>
+		enqueue(() =>
+			runReminderTick().catch((err) => ui.send(allowedChatId, `⚠️ <b>Pengecekan pengingat gagal</b>\n\n${escapeHtml(err.message)}`).catch(() => {})),
+		),
+	);
+	console.log('[bridge] reminder tick scheduled for 07:15 WIB daily');
 
 	pollLoop();
 }
