@@ -168,3 +168,55 @@ test('parseJsonLoose strips a code fence and still parses plain JSON', () => {
 	assert.deepStrictEqual(claude.parseJsonLoose('```\n{"a":1}\n```'), { a: 1 });
 	assert.deepStrictEqual(claude.parseJsonLoose('{"a":1}'), { a: 1 });
 });
+
+// --- runSkill: the deep-tier entry point docs/AGENTS-SKILLS.md's wiring
+// examples call as claude.runSkill(name, args, opts) ---
+
+test('runSkill sends "/<name> <args>" on stdin with no stdin doc given', async (t) => {
+	const child = fakeChild();
+	t.mock.method(cp, 'spawn', () => child);
+
+	const resultPromise = claude.runSkill('office-doc', 'default Memo reminder', {});
+
+	assert.strictEqual(child.stdin.chunks.join(''), '/office-doc default Memo reminder');
+
+	child.stdout.emit('data', envelope({ is_error: false, result: '{"title":"Memo","content":"..."}' }));
+	child.emit('close', 0);
+	const res = await resultPromise;
+	assert.deepStrictEqual(res.data, { title: 'Memo', content: '...' });
+});
+
+test('runSkill appends a large stdin document after the header line, never as argv', async (t) => {
+	const child = fakeChild();
+	let seenArgs;
+	t.mock.method(cp, 'spawn', (bin, args) => {
+		seenArgs = args;
+		return child;
+	});
+
+	const bigDoc = 'y'.repeat(50000);
+	const resultPromise = claude.runSkill('summarize-long', 'Some Title', { stdin: bigDoc, agent: 'long-doc-summarizer' });
+
+	assert.strictEqual(child.stdin.chunks.join(''), `/summarize-long Some Title\n\n${bigDoc}`);
+	assert.ok(!seenArgs.some((a) => a.includes('y'.repeat(100))), 'the document must never appear in argv');
+	assert.deepStrictEqual(
+		seenArgs.slice(seenArgs.indexOf('--agent'), seenArgs.indexOf('--agent') + 2),
+		['--agent', 'long-doc-summarizer'],
+	);
+
+	child.stdout.emit('data', envelope({ is_error: false, result: 'ok' }));
+	child.emit('close', 0);
+	await resultPromise;
+});
+
+test('runSkill with no args still produces a valid "/<name>" header', async (t) => {
+	const child = fakeChild();
+	t.mock.method(cp, 'spawn', () => child);
+
+	const resultPromise = claude.runSkill('calc-vision', '', { agent: 'vision-math-reader' });
+	assert.strictEqual(child.stdin.chunks.join(''), '/calc-vision');
+
+	child.stdout.emit('data', envelope({ is_error: false, result: '{"expression":"1+1"}' }));
+	child.emit('close', 0);
+	await resultPromise;
+});

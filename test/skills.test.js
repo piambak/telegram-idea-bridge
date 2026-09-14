@@ -94,7 +94,7 @@ test('event-parse\'s real {{extra}} token is substituted end-to-end by runFast',
 		return JSON.stringify({ title: 'Rapat', start: '2026-09-18T10:00', end: '2026-09-18T11:00', location: '', description: '', confidence: 0.9 });
 	};
 
-	await skills.runFast('event-parse', 'rapat besok', chat, { vars: { extra: 'Senin, 2026-09-14 09:30 WIB' } });
+	await skills.runFast('event-parse', 'rapat besok', chat, { extra: 'Senin, 2026-09-14 09:30 WIB' });
 
 	assert.ok(seenSystemPrompt.includes('Senin, 2026-09-14 09:30 WIB'), 'the substituted value should reach the system prompt');
 	assert.ok(!seenSystemPrompt.includes('{{extra}}'), 'the raw token should not survive substitution');
@@ -124,4 +124,29 @@ test('runFast returns the raw text unparsed for a non-json_mode skill', async ()
 	const chat = async () => 'Halo! Apa kabar?';
 	const result = await skills.runFast('ask', 'halo', chat);
 	assert.strictEqual(result, 'Halo! Apa kabar?');
+});
+
+// --- schemaFor: derives a --json-schema for claude.runSkill from a skill's
+// own output_required/output_types, so the deep tier's schema can never
+// drift out of sync with what the SKILL.md itself documents ---
+
+test('schemaFor builds a JSON Schema matching the skill\'s output_required/output_types', () => {
+	const schema = skills.schemaFor('idea-enhance');
+	assert.strictEqual(schema.type, 'object');
+	assert.deepStrictEqual(new Set(schema.required), new Set(['title', 'tags', 'body', 'language', 'save_confidence']));
+	assert.deepStrictEqual(schema.properties.title, { type: 'string' });
+	assert.deepStrictEqual(schema.properties.tags, { type: 'array' });
+	assert.deepStrictEqual(schema.properties.save_confidence, { type: 'number' });
+});
+
+test('every deep-tier skill\'s schemaFor() output validates its own documented example', () => {
+	for (const name of skills.listSkillNames()) {
+		const skill = skills.loadSkill(name);
+		if (skill.meta.tier !== 'deep' || !skill.meta.json_mode) continue;
+		const schema = skills.schemaFor(name);
+		const example = skills.extractJsonExample(skill.body);
+		for (const key of schema.required) {
+			assert.ok(key in example, `${name}: schemaFor() requires "${key}" but the example is missing it`);
+		}
+	}
 });

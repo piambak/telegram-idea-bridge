@@ -38,12 +38,13 @@ const models = require('./lib/models');
 const modelChat = async (messages) => {
 	const userText = messages.at(-1).content;
 	if (userText.includes('idea')) {
-		return [
-			'TITLE: Kios Pajak & Digital',
-			'TAGS: pajak, digital',
-			'',
-			'An enhanced idea with a <script>alert(1)</script> tag inside it.',
-		].join('\n');
+		return JSON.stringify({
+			title: 'Kios Pajak & Digital',
+			tags: ['pajak', 'digital'],
+			body: 'An enhanced idea with a <script>alert(1)</script> tag inside it.',
+			language: 'en',
+			save_confidence: 0.9,
+		});
 	}
 	return `stub reply for: ${userText}`;
 };

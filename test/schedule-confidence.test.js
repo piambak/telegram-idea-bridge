@@ -12,10 +12,15 @@ test('parseEvent injects today\'s WIB weekday into the prompt given to the model
 
 	await schedule.parseEvent('rapat Jumat depan', chat);
 
-	assert.match(
-		seenPrompt,
-		/\b(Minggu|Senin|Selasa|Rabu|Kamis|Jumat|Sabtu)\b,/,
-		'the system prompt should name today\'s weekday right before the date/time (docs/ANALYSIS.md bug #15)',
+	// The exact "<weekday>, <date> WIB" string schedule.js computes for right
+	// now — not just any weekday name, since the skill's own static example
+	// text ("Senin, 2026-09-14 09:30 WIB") would otherwise make this pass
+	// even if {{extra}} substitution were broken.
+	const now = schedule.nowInWib();
+	const expected = `${schedule.weekdayWib(now)}, ${schedule.formatWib(now)}`;
+	assert.ok(
+		seenPrompt.includes(expected),
+		`the system prompt should contain "${expected}" (docs/ANALYSIS.md bug #15)\ngot:\n${seenPrompt}`,
 	);
 });
 

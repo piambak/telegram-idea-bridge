@@ -1,12 +1,10 @@
 const fs = require('fs');
 const path = require('path');
-const { allowedChatId } = require('./lib/config');
+const { allowedChatId, knowledgeBaseDir } = require('./lib/config');
 const telegram = require('./lib/telegram');
 const knowledge = require('./lib/knowledge');
 const pdf = require('./lib/pdf');
 const vault = require('./lib/vault');
-const enhance = require('./lib/enhance');
-const jobs = require('./lib/jobs');
 const todo = require('./lib/todo');
 const calc = require('./lib/calc');
 const summarize = require('./lib/summarize');
@@ -19,6 +17,8 @@ const regmonitor = require('./lib/regmonitor');
 const images = require('./lib/images');
 const vaultsync = require('./lib/vaultsync');
 const state = require('./lib/state');
+const skills = require('./lib/skills');
+const claude = require('./lib/claude');
 const os = require('os');
 const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
@@ -85,7 +85,7 @@ async function handleIdea(chatId, rawText) {
 	await telegram.sendMessage(chatId, `Got it. Enhancing this idea with <b>${escapeHtml(model.label)}</b>...`);
 	startTyping(chatId);
 	try {
-		const { title, tags, body } = await enhance.enhanceIdea(rest, model.chat);
+		const { title, tags, body } = await skills.runFast('idea-enhance', rest, model.chat);
 		const filePath = knowledge.writeIdeaNote({ title, tags, rawIdea: rest, enhancedBody: body });
 		await telegram.sendMessage(
 			chatId,
@@ -102,10 +102,12 @@ async function handleIdea(chatId, rawText) {
 	}
 }
 
-// Generic runner for single-turn text jobs (grammar, prompt-gen, broadcast):
-// a system prompt + user text in, model reply out. Supports the same
+// Generic runner for single-turn fast-tier skills (grammar-fix, prompt-gen):
+// skill name + user text in, model reply out (via lib/skills.runFast).
+// `render` turns a json_mode skill's parsed object into the plain text to
+// show; defaults to identity for a plain-text skill. Supports the same
 // "<model>: text" override as idea enhancement.
-async function runSimpleJob(chatId, argText, { systemPrompt, verb, usage }) {
+async function runSkillJob(chatId, argText, { skillName, verb, usage, render = (r) => r }) {
 	if (!argText) {
 		await telegram.sendMessage(chatId, usage);
 		return;
@@ -114,11 +116,8 @@ async function runSimpleJob(chatId, argText, { systemPrompt, verb, usage }) {
 	const model = MODELS[modelKey];
 	startTyping(chatId);
 	try {
-		const result = await model.chat([
-			{ role: 'system', content: systemPrompt },
-			{ role: 'user', content: rest },
-		]);
-		await telegram.sendMessage(chatId, escapeHtml(result));
+		const result = await skills.runFast(skillName, rest, model.chat);
+		await telegram.sendMessage(chatId, escapeHtml(render(result)));
 	} catch (err) {
 		await telegram.sendMessage(chatId, `${verb} failed: ${escapeHtml(err.message)}`);
 	} finally {
@@ -139,10 +138,7 @@ async function handleBroadcast(chatId, argText) {
 	const model = MODELS[modelKey];
 	startTyping(chatId);
 	try {
-		const draft = await model.chat([
-			{ role: 'system', content: jobs.BROADCAST_PROMPT },
-			{ role: 'user', content: rest },
-		]);
+		const draft = await skills.runFast('wa-broadcast', rest, model.chat);
 		lastBroadcastDraft.set(chatId, draft);
 		await telegram.sendMessage(chatId, `${escapeHtml(draft)}\n\n— Send this to the group with /send, or /broadcast again to redraft.`);
 	} catch (err) {
@@ -442,11 +438,11 @@ async function handleExcel(chatId, argText) {
 	const { templateName, brief } = parseDocArgs(argText);
 	await telegram.sendMessage(
 		chatId,
-		`Drafting with Claude CLI${templateName ? ` using template "${escapeHtml(templateName)}"` : ' (new sheet)'}... usually 1-3 min.`,
+		`Drafting${templateName ? ` using template "${escapeHtml(templateName)}"` : ' (new sheet)'}...`,
 	);
 	startTyping(chatId);
 	try {
-		const { outputPath, title, usedTemplate } = await docgen.generateExcelDoc({ templateName, brief });
+		const { outputPath, title, usedTemplate } = await docgen.generateExcelDoc({ templateName, brief, chat: MODELS[DEFAULT_MODEL].chat });
 		// Saved to OneDrive already; also send it back so it's usable right
 		// away without switching devices (docs/ANALYSIS.md bug #12).
 		await telegram.sendDocument(
@@ -575,15 +571,32 @@ async function handlePdf(chatId, rawInput) {
 			chatId,
 			`Summarizing (${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`,
 		);
-		const summary = await summarize.summarize(text, model.chat).catch((err) => {
+		const summary = await summarize.summarize(text, model.chat, title).catch((err) => {
 			console.error('[bridge] summarize failed:', err.message);
 			return null;
 		});
+		// Deep tier (research-capturer): real tags instead of always [], found
+		// by actually reading the vault for related notes. Best-effort — a
+		// slow/failing capture call must not lose the already-extracted text.
+		const capture = await claude
+			.runSkill('source-capture', title, {
+				stdin: text,
+				schema: skills.schemaFor('source-capture'),
+				agent: 'research-capturer',
+				addDir: knowledgeBaseDir,
+				allowedTools: 'Read,Grep,Glob',
+				timeoutMs: 5 * 60 * 1000,
+			})
+			.catch((err) => {
+				console.error('[bridge] source-capture failed:', err.message);
+				return null;
+			});
+		const tags = capture && capture.ok && Array.isArray(capture.data.tags) ? capture.data.tags : [];
 
 		const { filePath, sidecarPath } = knowledge.writeSourceCapture({
 			title,
 			sourceUrl: finalUrl,
-			tags: [],
+			tags,
 			extractedText: text, // the full text — writeSourceCapture sidecars it to .txt itself if it's large
 			summary,
 			notes: '',
@@ -681,8 +694,9 @@ const HELP_TEXT = [
 
 // Jobs run concurrently. The old single-flight queue existed because the
 // default model was local Ollama on a one-core box; the default is now a
-// cloud provider (~600ms), while /doc and /excel shell out to the Claude CLI
-// for up to 5 minutes — serializing those blocked every other command.
+// cloud provider (~600ms), while /doc, long /summarize, and /pdf shell out
+// to the Claude CLI for up to 5 minutes — serializing those blocked every
+// other command.
 // ponytail: no concurrency cap. Add a small limiter if a local model ever
 // becomes the default again, or if Telegram rate-limits show up in the log.
 function enqueue(task) {
@@ -770,18 +784,19 @@ async function handleMessage(message) {
 	}
 	if (text.startsWith('/grammar')) {
 		enqueue(() =>
-			runSimpleJob(chatId, text.slice('/grammar'.length).trim(), {
-				systemPrompt: jobs.GRAMMAR_PROMPT,
+			runSkillJob(chatId, text.slice('/grammar'.length).trim(), {
+				skillName: 'grammar-fix',
 				verb: 'Grammar check',
 				usage: 'Usage: /grammar &lt;text&gt;',
+				render: (r) => r.corrected,
 			}),
 		);
 		return;
 	}
 	if (text.startsWith('/promptgen')) {
 		enqueue(() =>
-			runSimpleJob(chatId, text.slice('/promptgen'.length).trim(), {
-				systemPrompt: jobs.PROMPTGEN_PROMPT,
+			runSkillJob(chatId, text.slice('/promptgen'.length).trim(), {
+				skillName: 'prompt-gen',
 				verb: 'Prompt generation',
 				usage: 'Usage: /promptgen &lt;goal&gt;',
 			}),
