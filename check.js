@@ -23,19 +23,77 @@ assert.deepStrictEqual(parseModelOverride('grok: hi'), { modelKey: DEFAULT_MODEL
 assert.deepStrictEqual(parseModelOverride('groq: a\nb'), { modelKey: 'groq', rest: 'a\nb' });
 
 // --- HTML safety: every user-facing string must be Telegram-HTML-parseable --
-// sendMessage() uses parse_mode:'HTML'; a raw <brief> is rejected by Telegram
-// and the message silently never arrives.
+// parse_mode:'HTML' rejects a raw '<brief>'-style tag and the message
+// silently never arrives. blockquote joined lib/ui.js's card()/quietSection()
+// (docs/V2-SPEC.md §1); everything else matches Telegram's supported subset.
 const fs = require('fs');
-const src = fs.readFileSync(require('path').join(__dirname, 'bridge.js'), 'utf8');
-const ALLOWED = new Set(['b', 'i', 'u', 's', 'a', 'code', 'pre', 'br']);
-const offenders = [];
-for (const line of src.split('\n')) {
-	if (!line.includes('sendMessage(')) continue;
-	for (const [, tag] of line.matchAll(/<\/?([a-zA-Z][\w-]*)[\s>]/g)) {
-		if (!ALLOWED.has(tag.toLowerCase())) offenders.push(`${tag}: ${line.trim()}`);
+const path = require('path');
+const ALLOWED = new Set(['b', 'i', 'u', 's', 'a', 'code', 'pre', 'br', 'blockquote']);
+
+// The old version only looked at the single line containing the call name,
+// so a call spanning multiple lines (the common case for a template
+// literal) went unchecked (docs/ANALYSIS.md gap #21). This instead collects
+// every line from the call site until its parenthesis nesting returns to 0
+// (capped at 40 lines as a runaway guard) and lints that whole block.
+function findHtmlOffenders(filePath, callNames) {
+	const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+	const callPattern = new RegExp(`\\b(${callNames.join('|')})\\(`);
+	const offenders = [];
+	for (let i = 0; i < lines.length; i++) {
+		if (!callPattern.test(lines[i])) continue;
+		let depth = 0;
+		let started = false;
+		const block = [];
+		for (let j = i; j < lines.length && j < i + 40; j++) {
+			block.push(lines[j]);
+			for (const ch of lines[j]) {
+				if (ch === '(') {
+					depth++;
+					started = true;
+				} else if (ch === ')') {
+					depth--;
+				}
+			}
+			if (started && depth <= 0) break;
+		}
+		for (const [, tag] of block.join('\n').matchAll(/<\/?([a-zA-Z][\w-]*)[\s>]/g)) {
+			if (!ALLOWED.has(tag.toLowerCase())) offenders.push(`${tag} at ${path.basename(filePath)}:${i + 1}: ${lines[i].trim()}`);
+		}
+	}
+	return offenders;
+}
+
+const offenders = findHtmlOffenders(path.join(__dirname, 'bridge.js'), ['sendMessage', 'editMessageText', 'ui\\.send']);
+assert.deepStrictEqual(offenders, [], `unescaped non-HTML tags in a Telegram HTML call:\n${offenders.join('\n')}`);
+
+// The lint above only proves bridge.js is currently clean — prove the
+// multi-line scan itself actually catches something, using a throwaway
+// fixture, so a future change that breaks findHtmlOffenders (e.g. narrowing
+// the window back to one line) fails loudly instead of just finding nothing
+// to complain about.
+{
+	const os = require('os');
+	const fixture = path.join(os.tmpdir(), `check-html-lint-fixture-${process.pid}.js`);
+	fs.writeFileSync(
+		fixture,
+		[
+			"telegram.sendMessage(",
+			"\tchatId,",
+			"\t`<div>this tag is not in the allowed set</div>`,",
+			");",
+		].join('\n'),
+	);
+	try {
+		const fixtureOffenders = findHtmlOffenders(fixture, ['sendMessage']);
+		assert.ok(fixtureOffenders.length > 0, 'a multi-line call with a disallowed tag must be caught');
+		assert.ok(fixtureOffenders.every((o) => o.includes('div')), 'the offending tag name should be reported');
+
+		const cleanOffenders = findHtmlOffenders(fixture, ['someOtherCallNotPresent']);
+		assert.deepStrictEqual(cleanOffenders, [], 'a call name that never appears must never false-positive');
+	} finally {
+		fs.unlinkSync(fixture);
 	}
 }
-assert.deepStrictEqual(offenders, [], `unescaped non-HTML tags in sendMessage:\n${offenders.join('\n')}`);
 
 // --- per-job model defaults (JOB_MODELS) ------------------------------
 for (const [job, alias] of Object.entries(JOB_MODELS)) {

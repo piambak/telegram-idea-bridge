@@ -19,33 +19,43 @@ const vaultsync = require('./lib/vaultsync');
 const state = require('./lib/state');
 const skills = require('./lib/skills');
 const claude = require('./lib/claude');
+const ui = require('./lib/ui');
+const pending = require('./lib/pending');
 const os = require('os');
 const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
+const { escapeHtml } = ui;
+
+// Emoji + Indonesian descriptions for the Telegram command menu
+// (docs/V2-SPEC.md §1).
 const BOT_COMMANDS = [
-	{ command: 'start', description: 'Show what this bot does' },
-	{ command: 'list', description: 'List your most recent vault entries' },
-	{ command: 'search', description: 'Search your vault: /search <query>' },
-	{ command: 'get', description: 'Open a result by number: /get <n>' },
-	{ command: 'pdf', description: 'Capture a PDF: /pdf <link or title>' },
-	{ command: 'calc', description: 'Calculate: /calc <expr or word problem>, or send a photo' },
-	{ command: 'summarize', description: 'Summarize text or a vault note: /summarize <text | note n>' },
-	{ command: 'news', description: 'News digest: /news <topic>' },
-	{ command: 'schedule', description: 'Add to calendar: /schedule <freeform event text>' },
-	{ command: 'doc', description: 'Draft a Word doc: /doc <template or "default"> | <brief>' },
-	{ command: 'excel', description: 'Draft an Excel table: /excel <template or "default"> | <brief>' },
-	{ command: 'templates', description: 'List your .docx/.xlsx templates and their placeholders' },
-	{ command: 'regcheck', description: 'Check now for new Kemenkeu/DJP regulations' },
-	{ command: 'banner', description: 'Sample images for a banner: /banner <keyword>' },
-	{ command: 'grammar', description: 'Fix grammar: /grammar <text>' },
-	{ command: 'promptgen', description: 'Generate a prompt: /promptgen <goal>' },
-	{ command: 'broadcast', description: 'Draft a WA broadcast: /broadcast <brief>' },
-	{ command: 'send', description: 'Send the last /broadcast draft to your WhatsApp group' },
-	{ command: 'confirm', description: 'Confirm the last low-confidence /schedule event' },
-	{ command: 'todo', description: '/todo <item>, /todo list, /todo done <n>' },
-	{ command: 'models', description: 'List available models for overrides' },
-	{ command: 'help', description: 'Show available commands' },
+	{ command: 'start', description: '👋 Apa saja yang bisa bot ini lakukan' },
+	{ command: 'list', description: '📋 Catatan terbaru di vault' },
+	{ command: 'search', description: '🔍 Cari di vault: /search <kata kunci>' },
+	{ command: 'get', description: '📄 Buka hasil nomor: /get <n>' },
+	{ command: 'pdf', description: '📥 Simpan PDF: /pdf <tautan atau judul>' },
+	{ command: 'calc', description: '🧮 Hitung: /calc <ekspresi>, atau kirim foto' },
+	{ command: 'summarize', description: '📝 Ringkas teks/catatan: /summarize <teks | note n>' },
+	{ command: 'news', description: '📰 Ringkasan berita: /news <topik>' },
+	{ command: 'schedule', description: '📅 Tambah ke kalender: /schedule <teks acara>' },
+	{ command: 'confirm', description: '✅ Konfirmasi jadwal yang belum pasti' },
+	{ command: 'doc', description: '📃 Buat dokumen Word: /doc <template> | <ringkasan>' },
+	{ command: 'excel', description: '📊 Buat tabel Excel: /excel <template> | <ringkasan>' },
+	{ command: 'templates', description: '🗂 Daftar template Word/Excel' },
+	{ command: 'regcheck', description: '⚖️ Cek peraturan Kemenkeu/DJP terbaru' },
+	{ command: 'banner', description: '🎨 Cari gambar untuk banner: /banner <kata kunci>' },
+	{ command: 'grammar', description: '✏️ Perbaiki tata bahasa: /grammar <teks>' },
+	{ command: 'promptgen', description: '💡 Buat prompt AI: /promptgen <tujuan>' },
+	{ command: 'broadcast', description: '📢 Draft broadcast WA: /broadcast <ringkasan>' },
+	{ command: 'todo', description: '☑️ Daftar tugas: /todo <item>, /todo list' },
+	{ command: 'models', description: '🤖 Daftar model AI yang tersedia' },
+	{ command: 'help', description: '❓ Daftar lengkap perintah' },
 ];
+
+const BOT_DESCRIPTION =
+	'Second brain pribadi via Telegram. Kirim ide apa saja untuk disimpan ke vault, atau gunakan ' +
+	'/pdf, /calc, /schedule, /doc, /excel, /news, /regcheck, /banner, /broadcast, dan /todo. Ketik /start untuk ringkasannya.';
+const BOT_SHORT_DESCRIPTION = 'Bot ide & produktivitas pribadi';
 
 const OFFSET_STATE_FILE = 'offset';
 
@@ -82,21 +92,26 @@ function syncVaultQuietly(message) {
 async function handleIdea(chatId, rawText) {
 	const { modelKey, rest } = parseModelOverride(rawText);
 	const model = MODELS[modelKey];
-	await telegram.sendMessage(chatId, `Got it. Enhancing this idea with <b>${escapeHtml(model.label)}</b>...`);
+	const job = await ui.progress(chatId, `⏳ Enhancing this idea with <b>${escapeHtml(model.label)}</b>...`);
 	startTyping(chatId);
 	try {
 		const { title, tags, body } = await skills.runFast('idea-enhance', rest, model.chat);
 		const filePath = knowledge.writeIdeaNote({ title, tags, rawIdea: rest, enhancedBody: body });
-		await telegram.sendMessage(
-			chatId,
-			`<b>${escapeHtml(title)}</b>\n\n${escapeHtml(body)}\n\n💾 Saved to notes/${path.basename(filePath)}`,
+		await job.finish(
+			ui.card({
+				icon: '💡',
+				title,
+				subtitle: (tags || []).map((t) => `#${t}`).join(' '),
+				body,
+				footer: `💾 notes/${path.basename(filePath)}`,
+			}),
 		);
 		// Fire-and-forget: the note is already saved locally, so a slow (or
 		// failing) push must never delay or fail the reply (docs/ANALYSIS.md
 		// bug #5). syncVaultQuietly itself never rejects.
 		syncVaultQuietly(`Add idea: ${title}`);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Enhancement failed: ${escapeHtml(err.message)}`);
+		await job.finish(`Enhancement failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
@@ -109,7 +124,7 @@ async function handleIdea(chatId, rawText) {
 // "<model>: text" override as idea enhancement.
 async function runSkillJob(chatId, argText, { skillName, verb, usage, render = (r) => r }) {
 	if (!argText) {
-		await telegram.sendMessage(chatId, usage);
+		await ui.send(chatId, usage);
 		return;
 	}
 	const { modelKey, rest } = parseModelOverride(argText);
@@ -117,56 +132,75 @@ async function runSkillJob(chatId, argText, { skillName, verb, usage, render = (
 	startTyping(chatId);
 	try {
 		const result = await skills.runFast(skillName, rest, model.chat);
-		await telegram.sendMessage(chatId, escapeHtml(render(result)));
+		await ui.send(chatId, escapeHtml(render(result)));
 	} catch (err) {
-		await telegram.sendMessage(chatId, `${verb} failed: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `${verb} failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
 }
 
-// Remembers the last drafted broadcast per chat, so /send can confirm and
-// actually post it without re-drafting.
-const lastBroadcastDraft = new Map();
+// Broadcast drafts, and every /todo item, offer inline buttons instead of a
+// follow-up command (docs/V2-SPEC.md §1). Each button's payload lives in
+// .state/pending.json (lib/pending.js) keyed by a short id, not in memory —
+// a restart never loses a draft.
+const BROADCAST_KEYBOARD = (id) =>
+	ui.keyboard([[{ text: '📤 Kirim', callback_data: `bcsend:${id}` }, { text: '🔁 Draft ulang', callback_data: `bcredraft:${id}` }]]);
 
 async function handleBroadcast(chatId, argText) {
 	if (!argText) {
-		await telegram.sendMessage(chatId, 'Usage: /broadcast &lt;brief&gt;');
+		await ui.send(chatId, 'Usage: /broadcast &lt;brief&gt;');
 		return;
 	}
 	const { modelKey, rest } = parseModelOverride(argText);
 	const model = MODELS[modelKey];
+	const job = await ui.progress(chatId, '⏳ Drafting broadcast...');
 	startTyping(chatId);
 	try {
 		const draft = await skills.runFast('wa-broadcast', rest, model.chat);
-		lastBroadcastDraft.set(chatId, draft);
-		await telegram.sendMessage(chatId, `${escapeHtml(draft)}\n\n— Send this to the group with /send, or /broadcast again to redraft.`);
+		const id = pending.create('broadcast', { brief: rest, draft });
+		await job.finish(escapeHtml(draft), { reply_markup: BROADCAST_KEYBOARD(id) });
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Broadcast draft failed: ${escapeHtml(err.message)}`);
+		await job.finish(`Broadcast draft failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
 }
 
-async function handleSend(chatId) {
-	const draft = lastBroadcastDraft.get(chatId);
-	if (!draft) {
-		await telegram.sendMessage(chatId, 'No broadcast draft to send. Use /broadcast &lt;brief&gt; first.');
-		return;
-	}
-	try {
-		await whatsapp.sendToGroup(draft);
-		lastBroadcastDraft.delete(chatId);
-		await telegram.sendMessage(chatId, '✅ Sent to the WhatsApp group.');
-	} catch (err) {
-		await telegram.sendMessage(chatId, `Send failed: ${escapeHtml(err.message)}`);
-	}
+// [📤 Kirim] — posts the held draft to the WhatsApp group.
+async function handleBroadcastSend(chatId, messageId, entry) {
+	await whatsapp.sendToGroup(entry.data.draft);
+	await telegram.editMessageText(chatId, messageId, `${escapeHtml(entry.data.draft)}\n\n<i>✅ Sent to the WhatsApp group.</i>`);
 }
 
-// The numbers in a /todo list are positions, and completing an item
+// [🔁 Draft ulang] — redrafts from the same brief and re-attaches fresh buttons.
+async function handleBroadcastRedraft(chatId, messageId, entry) {
+	const model = MODELS[DEFAULT_MODEL];
+	const draft = await skills.runFast('wa-broadcast', entry.data.brief, model.chat);
+	const id = pending.create('broadcast', { brief: entry.data.brief, draft });
+	await telegram.editMessageText(chatId, messageId, escapeHtml(draft), { reply_markup: BROADCAST_KEYBOARD(id) });
+}
+
+// The numbers in "/todo done <n>" are positions, and completing an item
 // renumbers everything below it. Remembering what was actually shown lets
 // "done 2" close the item the user read as 2, even if the list moved since.
+// (The ✅ buttons below don't have this problem — each one carries the
+// item's own text, not a position.)
 const lastTodoListing = new Map();
+
+// Builds the current open-todo view: text + one ✅ button per item. Reused
+// by both /todo list and the done-button handler (which refreshes the same
+// message in place after marking one done).
+function buildTodoListView() {
+	const items = todo.listItems();
+	if (items.length === 0) {
+		return { text: 'No open to-dos. Add one: /todo &lt;item&gt;', keyboard: undefined };
+	}
+	const rows = items.map((it) => [
+		{ text: `✅ ${it.text.length > 40 ? `${it.text.slice(0, 40)}…` : it.text}`, callback_data: `tododone:${pending.create('todo_done', { text: it.text })}` },
+	]);
+	return { text: '<b>Open to-dos</b>', keyboard: ui.keyboard(rows) };
+}
 
 async function handleTodo(chatId, arg) {
 	const [sub, ...restParts] = arg.split(/\s+/);
@@ -175,18 +209,14 @@ async function handleTodo(chatId, arg) {
 	if (arg === 'list' || arg === '') {
 		const items = todo.listItems();
 		lastTodoListing.set(chatId, items.map((it) => it.text));
-		if (items.length === 0) {
-			await telegram.sendMessage(chatId, 'No open to-dos. Add one: /todo &lt;item&gt;');
-			return;
-		}
-		const lines = items.map((it, i) => `${i + 1}. ${escapeHtml(it.text)}`);
-		await telegram.sendMessage(chatId, `Open to-dos:\n\n${lines.join('\n')}\n\nMark done: /todo done &lt;n&gt;`);
+		const { text, keyboard } = buildTodoListView();
+		await telegram.sendMessage(chatId, text, keyboard ? { reply_markup: keyboard } : undefined);
 		return;
 	}
 	if (sub === 'done') {
 		const n = Number(rest);
 		if (!Number.isInteger(n) || n < 1) {
-			await telegram.sendMessage(chatId, 'Usage: /todo done &lt;n&gt; — the number from /todo list.');
+			await ui.send(chatId, 'Usage: /todo done &lt;n&gt; — the number from /todo list.');
 			return;
 		}
 		try {
@@ -197,20 +227,29 @@ async function handleTodo(chatId, arg) {
 			const text = expected ? todo.markDoneMatching(expected) : todo.markDone(n);
 			lastTodoListing.delete(chatId); // positions just shifted; force a re-list
 			await syncVaultQuietly(`Todo done: ${text}`);
-			await telegram.sendMessage(chatId, `✅ Done: ${escapeHtml(text)}`);
+			await ui.send(chatId, `✅ Done: ${escapeHtml(text)}`);
 		} catch (err) {
-			await telegram.sendMessage(chatId, escapeHtml(err.message) + '\n\nRun /todo list to see current numbers.');
+			await ui.send(chatId, escapeHtml(err.message) + '\n\nRun /todo list to see current numbers.');
 		}
 		return;
 	}
 	todo.addItem(arg);
 	await syncVaultQuietly(`Todo add: ${arg}`);
-	await telegram.sendMessage(chatId, `➕ Added: ${escapeHtml(arg)}`);
+	await ui.send(chatId, `➕ Added: ${escapeHtml(arg)}`);
+}
+
+// ✅ button on a /todo list item — marks it done and refreshes the same
+// message in place with the remaining items and fresh buttons.
+async function handleTodoDoneButton(chatId, messageId, entry) {
+	const text = todo.markDoneMatching(entry.data.text);
+	await syncVaultQuietly(`Todo done: ${text}`);
+	const { text: newText, keyboard } = buildTodoListView();
+	await telegram.editMessageText(chatId, messageId, `✅ ${escapeHtml(text)}\n\n${newText}`, keyboard ? { reply_markup: keyboard } : undefined);
 }
 
 async function handleCalc(chatId, argText) {
 	if (!argText) {
-		await telegram.sendMessage(chatId, 'Usage: /calc &lt;expression or word problem&gt;, or send a photo of a math problem.');
+		await ui.send(chatId, 'Usage: /calc &lt;expression or word problem&gt;, or send a photo of a math problem.');
 		return;
 	}
 	const { modelKey, rest } = parseModelOverride(argText);
@@ -218,9 +257,9 @@ async function handleCalc(chatId, argText) {
 	startTyping(chatId);
 	try {
 		const { expression, result } = await calc.solveText(rest, model.chat);
-		await telegram.sendMessage(chatId, `<code>${escapeHtml(expression)}</code> = <b>${escapeHtml(result)}</b>`);
+		await ui.send(chatId, `<code>${escapeHtml(expression)}</code> = <b>${escapeHtml(result)}</b>`);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Calculation failed: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Calculation failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
@@ -235,9 +274,9 @@ async function handleCalcImage(chatId, fileId) {
 		imagePath = path.join(os.tmpdir(), `calc-${chatId}-${Date.now()}${path.extname(file.file_path) || '.jpg'}`);
 		fs.writeFileSync(imagePath, buffer);
 		const { expression, result } = await calc.solveImage(imagePath);
-		await telegram.sendMessage(chatId, `<code>${escapeHtml(expression)}</code> = <b>${escapeHtml(result)}</b>`);
+		await ui.send(chatId, `<code>${escapeHtml(expression)}</code> = <b>${escapeHtml(result)}</b>`);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Calculation failed: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Calculation failed: ${escapeHtml(err.message)}`);
 	} finally {
 		if (imagePath) fs.unlink(imagePath, () => {});
 		stopTyping();
@@ -250,7 +289,7 @@ async function handleCalcImage(chatId, fileId) {
 // the Claude CLI, short ones to the fast model.
 async function handleSummarize(chatId, argText) {
 	if (!argText) {
-		await telegram.sendMessage(
+		await ui.send(
 			chatId,
 			'Usage: /summarize &lt;text&gt;\nOr summarize a vault entry: /summarize note &lt;n&gt; (after /list or /search)',
 		);
@@ -268,7 +307,7 @@ async function handleSummarize(chatId, argText) {
 		const results = lastResults.get(chatId);
 		const n = Number(noteMatch[1]);
 		if (!results || n < 1 || n > results.length) {
-			await telegram.sendMessage(chatId, 'Run /list or /search first, then /summarize note &lt;n&gt; with a valid number.');
+			await ui.send(chatId, 'Run /list or /search first, then /summarize note &lt;n&gt; with a valid number.');
 			return;
 		}
 		const target = results[n - 1];
@@ -276,28 +315,28 @@ async function handleSummarize(chatId, argText) {
 			text = vault.readNote(target.path);
 			sourceLabel = target.path;
 		} catch (err) {
-			await telegram.sendMessage(chatId, `Couldn't open that entry: ${escapeHtml(err.message)}`);
+			await ui.send(chatId, `Couldn't open that entry: ${escapeHtml(err.message)}`);
 			return;
 		}
 	}
 
 	if (text.trim().length < 200) {
-		await telegram.sendMessage(chatId, 'That is already short enough to read as-is - send at least a couple of paragraphs.');
+		await ui.send(chatId, 'That is already short enough to read as-is - send at least a couple of paragraphs.');
 		return;
 	}
 
 	const usingClaude = text.length > summarize.CLAUDE_LENGTH_THRESHOLD;
 	const where = sourceLabel ? `<b>${escapeHtml(sourceLabel)}</b> ` : '';
-	await telegram.sendMessage(
+	const job = await ui.progress(
 		chatId,
-		`Summarizing ${where}(${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`,
+		`⏳ Summarizing ${where}(${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`,
 	);
 	startTyping(chatId);
 	try {
 		const summary = await summarize.summarize(text, model.chat);
-		await telegram.sendMessage(chatId, escapeHtml(summary));
+		await job.finish(escapeHtml(summary));
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Summarize failed: ${escapeHtml(err.message)}`);
+		await job.finish(`Summarize failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
@@ -305,7 +344,7 @@ async function handleSummarize(chatId, argText) {
 
 async function handleNews(chatId, rawTopic) {
 	if (!rawTopic) {
-		await telegram.sendMessage(chatId, 'Usage: /news &lt;topic&gt;');
+		await ui.send(chatId, 'Usage: /news &lt;topic&gt;');
 		return;
 	}
 	const { modelKey, rest: topic } = parseModelOverride(rawTopic);
@@ -314,28 +353,29 @@ async function handleNews(chatId, rawTopic) {
 	try {
 		const headlines = await news.fetchHeadlines(topic, { limit: 8 });
 		if (headlines.length === 0) {
-			await telegram.sendMessage(chatId, `No recent news found for "${escapeHtml(topic)}".`);
+			await ui.send(chatId, `No recent news found for "${escapeHtml(topic)}".`);
 			return;
 		}
 		const digest = await news.synthesizeDigest(headlines, model.chat);
 		const links = headlines
 			.map((h, i) => `${i + 1}. <a href="${escapeHtml(h.link)}">${escapeHtml(h.title)}</a> — ${escapeHtml(h.source)}`)
 			.join('\n');
-		await telegram.sendMessage(chatId, `<b>${escapeHtml(topic)}</b>\n\n${escapeHtml(digest)}\n\n${links}`);
+		const cardHtml = ui.card({ icon: '📰', title: topic, body: digest });
+		await ui.send(chatId, `${cardHtml}\n\n${links}`);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `News lookup failed: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `News lookup failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
 }
 
 // Holds a low-confidence parsed event awaiting /confirm, per chat — mirrors
-// lastBroadcastDraft/{/broadcast,/send}. Cleared once confirmed.
+// the broadcast draft pattern. Cleared once confirmed.
 const pendingSchedule = new Map();
 
 async function handleSchedule(chatId, rawText) {
 	if (!rawText) {
-		await telegram.sendMessage(chatId, 'Usage: /schedule &lt;event, e.g. "meeting with tax team tomorrow 2pm at room 305&quot;&gt;');
+		await ui.send(chatId, 'Usage: /schedule &lt;event, e.g. "meeting with tax team tomorrow 2pm at room 305&quot;&gt;');
 		return;
 	}
 	const { modelKey, rest } = parseModelOverride(rawText);
@@ -372,24 +412,24 @@ async function handleSchedule(chatId, rawText) {
 			`📅 <b>${escapeHtml(event.title)}</b>\n${escapeHtml(event.start)} – ${escapeHtml(event.end)} WIB${event.location ? `\n📍 ${escapeHtml(event.location)}` : ''}${calendarLine}`,
 		);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Scheduling failed: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Scheduling failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
 }
 
 async function handleScheduleConfirm(chatId) {
-	const pending = pendingSchedule.get(chatId);
-	if (!pending) {
-		await telegram.sendMessage(chatId, 'No pending event to confirm. Use /schedule first.');
+	const pendingEvent = pendingSchedule.get(chatId);
+	if (!pendingEvent) {
+		await ui.send(chatId, 'No pending event to confirm. Use /schedule first.');
 		return;
 	}
 	try {
-		await radicale.pushEvent(pending.uid, pending.ics);
+		await radicale.pushEvent(pendingEvent.uid, pendingEvent.ics);
 		pendingSchedule.delete(chatId);
-		await telegram.sendMessage(chatId, `✅ Added <b>${escapeHtml(pending.event.title)}</b> to your calendar.`);
+		await ui.send(chatId, `✅ Added <b>${escapeHtml(pendingEvent.event.title)}</b> to your calendar.`);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Couldn't add to your calendar: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Couldn't add to your calendar: ${escapeHtml(err.message)}`);
 	}
 }
 
@@ -404,19 +444,22 @@ function parseDocArgs(argText) {
 
 async function handleDoc(chatId, argText) {
 	if (!argText || !argText.includes('|')) {
-		await telegram.sendMessage(chatId, 'Usage: /doc &lt;template name or &quot;default&quot;&gt; | &lt;brief&gt;\ne.g. /doc default | Memo reminder for monthly report deadline');
+		await ui.send(chatId, 'Usage: /doc &lt;template name or &quot;default&quot;&gt; | &lt;brief&gt;\ne.g. /doc default | Memo reminder for monthly report deadline');
 		return;
 	}
 	const { templateName, brief } = parseDocArgs(argText);
-	await telegram.sendMessage(
+	const job = await ui.progress(
 		chatId,
-		`Drafting with Claude CLI${templateName ? ` using template "${escapeHtml(templateName)}"` : ' (default layout)'}... usually 1-3 min.`,
+		`⏳ Drafting with Claude CLI${templateName ? ` using template "${escapeHtml(templateName)}"` : ' (default layout)'}... usually 1-3 min.`,
 	);
 	startTyping(chatId);
 	try {
 		const { outputPath, title, usedTemplate } = await docgen.generateWordDoc({ templateName, brief });
+		await job.finish(`✅ Drafted <b>${escapeHtml(title)}</b>`);
 		// Saved to OneDrive already; also send it back so it's usable right
-		// away without switching devices (docs/ANALYSIS.md bug #12).
+		// away without switching devices (docs/ANALYSIS.md bug #12). A file
+		// can't replace a text message via edit, so this is still a second,
+		// necessary message.
 		await telegram.sendDocument(
 			chatId,
 			fs.readFileSync(outputPath),
@@ -424,7 +467,7 @@ async function handleDoc(chatId, argText) {
 			`💾 <b>${escapeHtml(title)}</b>\nSaved to OneDrive: Bot Output\\${escapeHtml(path.basename(outputPath))}${usedTemplate ? '' : '\n(no matching template found — used default layout)'}`,
 		);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Doc generation failed: ${escapeHtml(err.message)}`);
+		await job.finish(`Doc generation failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
@@ -432,19 +475,15 @@ async function handleDoc(chatId, argText) {
 
 async function handleExcel(chatId, argText) {
 	if (!argText || !argText.includes('|')) {
-		await telegram.sendMessage(chatId, 'Usage: /excel &lt;template name or &quot;default&quot;&gt; | &lt;brief describing the data&gt;');
+		await ui.send(chatId, 'Usage: /excel &lt;template name or &quot;default&quot;&gt; | &lt;brief describing the data&gt;');
 		return;
 	}
 	const { templateName, brief } = parseDocArgs(argText);
-	await telegram.sendMessage(
-		chatId,
-		`Drafting${templateName ? ` using template "${escapeHtml(templateName)}"` : ' (new sheet)'}...`,
-	);
+	const job = await ui.progress(chatId, `⏳ Drafting${templateName ? ` using template "${escapeHtml(templateName)}"` : ' (new sheet)'}...`);
 	startTyping(chatId);
 	try {
 		const { outputPath, title, usedTemplate } = await docgen.generateExcelDoc({ templateName, brief, chat: MODELS[DEFAULT_MODEL].chat });
-		// Saved to OneDrive already; also send it back so it's usable right
-		// away without switching devices (docs/ANALYSIS.md bug #12).
+		await job.finish(`✅ Drafted <b>${escapeHtml(title)}</b>`);
 		await telegram.sendDocument(
 			chatId,
 			fs.readFileSync(outputPath),
@@ -452,7 +491,7 @@ async function handleExcel(chatId, argText) {
 			`💾 <b>${escapeHtml(title)}</b>\nSaved to OneDrive: Bot Output\\${escapeHtml(path.basename(outputPath))}${usedTemplate ? '' : '\n(no matching template found — created a new sheet)'}`,
 		);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Excel generation failed: ${escapeHtml(err.message)}`);
+		await job.finish(`Excel generation failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
@@ -462,24 +501,22 @@ async function runRegulationCheck(chatId, { announceNoChange = false, modelKey =
 	const model = MODELS[modelKey] || MODELS[DEFAULT_MODEL];
 	const newItems = await regmonitor.checkForNew();
 	if (newItems.length === 0) {
-		if (announceNoChange) await telegram.sendMessage(chatId, 'No new Kemenkeu regulations since last check.');
+		if (announceNoChange) await ui.send(chatId, 'No new Kemenkeu regulations since last check.');
 		return;
 	}
 	const overview = await regmonitor.synthesizeOverview(newItems, model.chat).catch(() => '');
 	const lines = newItems
 		.map((it) => `• <a href="${escapeHtml(it.url)}">${escapeHtml(it.number)}</a> — ${escapeHtml(it.title)}`)
 		.join('\n');
-	await telegram.sendMessage(
-		chatId,
-		`📋 <b>${newItems.length} new Kemenkeu regulation(s)</b>\n\n${overview ? `${escapeHtml(overview)}\n\n` : ''}${lines}`,
-	);
+	const cardHtml = ui.card({ icon: '📋', title: `${newItems.length} new Kemenkeu regulation(s)`, body: overview || undefined });
+	await ui.send(chatId, `${cardHtml}\n\n${lines}`);
 }
 
 async function handleTemplates(chatId) {
 	try {
 		const items = await docgen.listTemplates();
 		if (items.length === 0) {
-			await telegram.sendMessage(chatId, 'No templates yet. Drop .docx / .xlsx files into the OneDrive folder: Bot Templates');
+			await ui.send(chatId, 'No templates yet. Drop .docx / .xlsx files into the OneDrive folder: Bot Templates');
 			return;
 		}
 		const lines = items.map((it) => {
@@ -489,12 +526,12 @@ async function handleTemplates(chatId) {
 			if (it.tags.length === 0) return `${head}\n   no {placeholders} — will be copied unchanged`;
 			return `${head}\n   fills: ${it.tags.map((t) => escapeHtml('{' + t + '}')).join(', ')}`;
 		});
-		await telegram.sendMessage(
+		await ui.send(
 			chatId,
 			`<b>Your templates</b> (OneDrive → Bot Templates)\n\n${lines.join('\n\n')}\n\nUse one: /doc &lt;part of the name&gt; | &lt;brief&gt;\nPut {title} {content} {date} {author} in the file where text should go.`,
 		);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Could not list templates: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Could not list templates: ${escapeHtml(err.message)}`);
 	}
 }
 
@@ -503,7 +540,7 @@ async function handleRegcheck(chatId, modelKeyArg) {
 	try {
 		await runRegulationCheck(chatId, { announceNoChange: true, modelKey: MODELS[modelKeyArg] ? modelKeyArg : modelForJob('regcheck') });
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Regulation check failed: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Regulation check failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
@@ -511,7 +548,7 @@ async function handleRegcheck(chatId, modelKeyArg) {
 
 async function handleBanner(chatId, rawKeyword) {
 	if (!rawKeyword) {
-		await telegram.sendMessage(chatId, 'Usage: /banner &lt;keyword&gt;, e.g. /banner office christmas celebration');
+		await ui.send(chatId, 'Usage: /banner &lt;keyword&gt;, e.g. /banner office christmas celebration');
 		return;
 	}
 	const { modelKey, rest: keyword } = parseModelOverride(rawKeyword, 'banner');
@@ -524,7 +561,7 @@ async function handleBanner(chatId, rawKeyword) {
 		const photos = (await images.searchImages(query, { perPage: 6 })).slice(0, 10);
 		const caption = `🎨 Search: <b>${escapeHtml(query)}</b>`;
 		if (photos.length === 0) {
-			await telegram.sendMessage(chatId, `No images found for "${escapeHtml(query)}".`);
+			await ui.send(chatId, `No images found for "${escapeHtml(query)}".`);
 		} else if (photos.length === 1) {
 			await telegram.sendPhoto(chatId, photos[0].imageUrl, caption);
 		} else {
@@ -534,7 +571,7 @@ async function handleBanner(chatId, rawKeyword) {
 			);
 		}
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Banner search failed: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Banner search failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
@@ -544,7 +581,7 @@ async function handleModels(chatId) {
 	const lines = Object.entries(MODELS).map(
 		([key, m]) => `${key === DEFAULT_MODEL ? '⭐' : '  '} <b>${escapeHtml(key)}</b> — ${escapeHtml(m.label)}`,
 	);
-	await telegram.sendMessage(
+	await ui.send(
 		chatId,
 		`Available models (⭐ = default):\n\n${lines.join('\n')}\n\nOverride per message: "&lt;model&gt;: your idea", e.g. "groq: summarize this trend".`,
 	);
@@ -552,25 +589,22 @@ async function handleModels(chatId) {
 
 async function handlePdf(chatId, rawInput) {
 	if (!rawInput) {
-		await telegram.sendMessage(chatId, 'Usage: /pdf (link or document title)');
+		await ui.send(chatId, 'Usage: /pdf (link or document title)');
 		return;
 	}
 	const { modelKey, rest: input } = parseModelOverride(rawInput);
 	const model = MODELS[modelKey];
-	await telegram.sendMessage(chatId, `Looking up "${escapeHtml(input)}"...`);
+	const job = await ui.progress(chatId, `⏳ Looking up "${escapeHtml(input)}"...`);
 	startTyping(chatId);
 	try {
 		const url = await pdf.resolvePdfUrl(input);
-		await telegram.sendMessage(chatId, `Found: ${escapeHtml(url)}\nDownloading and extracting text...`);
+		await job.update(`⏳ Found: ${escapeHtml(url)}\nDownloading and extracting text...`);
 		const { buffer, finalUrl } = await pdf.fetchPdfBuffer(url);
 		const text = await pdf.extractText(buffer);
 
 		const title = input.length < 80 && !pdf.isUrl(input) ? input : finalUrl.split('/').pop() || 'PDF Source';
 		const usingClaude = text.length > summarize.CLAUDE_LENGTH_THRESHOLD;
-		await telegram.sendMessage(
-			chatId,
-			`Summarizing (${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`,
-		);
+		await job.update(`⏳ Summarizing (${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`);
 		const summary = await summarize.summarize(text, model.chat, title).catch((err) => {
 			console.error('[bridge] summarize failed:', err.message);
 			return null;
@@ -603,19 +637,12 @@ async function handlePdf(chatId, rawInput) {
 		});
 		const summaryLine = summary ? `\n\n${summary}` : '\n\n(summary failed, but the full text was still saved)';
 		const sidecarLine = sidecarPath ? `\n📄 Full text: external-sources/${path.basename(sidecarPath)}` : '';
-		await telegram.sendMessage(
-			chatId,
-			`💾 Captured "${escapeHtml(title)}" to external-sources/${path.basename(filePath)}${sidecarLine}${escapeHtml(summaryLine)}`,
-		);
+		await job.finish(`💾 Captured "${escapeHtml(title)}" to external-sources/${path.basename(filePath)}${sidecarLine}${escapeHtml(summaryLine)}`);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `PDF capture failed: ${escapeHtml(err.message)}`);
+		await job.finish(`PDF capture failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
 	}
-}
-
-function escapeHtml(s) {
-	return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // Remembers the last /list or /search results per chat, so /get &lt;n&gt; can
@@ -626,33 +653,33 @@ async function handleList(chatId) {
 	const results = vault.listNotes(10);
 	lastResults.set(chatId, results);
 	if (results.length === 0) {
-		await telegram.sendMessage(chatId, 'Your vault is empty so far.');
+		await ui.send(chatId, 'Your vault is empty so far.');
 		return;
 	}
 	const lines = results.map((r, i) => `${i + 1}. <b>${escapeHtml(r.title)}</b>\n   ${escapeHtml(r.path)}`);
-	await telegram.sendMessage(chatId, `Most recent vault entries:\n\n${lines.join('\n')}\n\nUse /get &lt;n&gt; to open one.`);
+	await ui.send(chatId, `Most recent vault entries:\n\n${lines.join('\n')}\n\nUse /get &lt;n&gt; to open one.`);
 }
 
 async function handleSearch(chatId, query) {
 	if (!query) {
-		await telegram.sendMessage(chatId, 'Usage: /search &lt;query&gt;');
+		await ui.send(chatId, 'Usage: /search &lt;query&gt;');
 		return;
 	}
 	const results = vault.searchNotes(query, 10);
 	lastResults.set(chatId, results);
 	if (results.length === 0) {
-		await telegram.sendMessage(chatId, `No matches for "${escapeHtml(query)}".`);
+		await ui.send(chatId, `No matches for "${escapeHtml(query)}".`);
 		return;
 	}
 	const lines = results.map((r, i) => `${i + 1}. <b>${escapeHtml(r.title)}</b>\n   ...${escapeHtml(r.snippet)}...`);
-	await telegram.sendMessage(chatId, `Matches for "${escapeHtml(query)}":\n\n${lines.join('\n\n')}\n\nUse /get &lt;n&gt; to open one.`);
+	await ui.send(chatId, `Matches for "${escapeHtml(query)}":\n\n${lines.join('\n\n')}\n\nUse /get &lt;n&gt; to open one.`);
 }
 
 async function handleGet(chatId, arg) {
 	const results = lastResults.get(chatId);
 	const n = Number(arg);
 	if (!results || !Number.isInteger(n) || n < 1 || n > results.length) {
-		await telegram.sendMessage(chatId, 'Run /list or /search first, then /get &lt;n&gt; with a valid number.');
+		await ui.send(chatId, 'Run /list or /search first, then /get &lt;n&gt; with a valid number.');
 		return;
 	}
 	const target = results[n - 1];
@@ -660,10 +687,28 @@ async function handleGet(chatId, arg) {
 		const content = vault.readNote(target.path);
 		const MAX = 3800;
 		const body = content.length > MAX ? `${content.slice(0, MAX)}\n\n…(truncated, ${content.length.toLocaleString()} chars total)` : content;
-		await telegram.sendMessage(chatId, `<b>${escapeHtml(target.path)}</b>\n\n<pre>${escapeHtml(body)}</pre>`);
+		await ui.send(chatId, `<b>${escapeHtml(target.path)}</b>\n\n<pre>${escapeHtml(body)}</pre>`);
 	} catch (err) {
-		await telegram.sendMessage(chatId, `Couldn't open that entry: ${escapeHtml(err.message)}`);
+		await ui.send(chatId, `Couldn't open that entry: ${escapeHtml(err.message)}`);
 	}
+}
+
+async function handleStart(chatId) {
+	const html = ui.card({
+		icon: '👋',
+		title: 'Idea Bridge',
+		subtitle: 'Second brain pribadi via Telegram',
+		sections: [
+			{
+				label: '📝 Catatan',
+				items: ['Ketik apa saja untuk disimpan sebagai ide', '/list, /search, /get — buka catatan', '/pdf — simpan PDF', '/summarize — ringkas teks/catatan'],
+			},
+			{ label: '🗓 Jadwal & dokumen', items: ['/schedule — tambah ke kalender', '/doc, /excel — buat dokumen', '/templates — lihat template'] },
+			{ label: '🧮 Lainnya', items: ['/calc — hitung (teks atau foto)', '/news, /regcheck, /banner', '/broadcast, /todo, /grammar, /promptgen'] },
+		],
+		footer: '/help untuk daftar lengkap perintah',
+	});
+	await ui.send(chatId, html);
 }
 
 const HELP_TEXT = [
@@ -676,8 +721,8 @@ const HELP_TEXT = [
 	'/pdf &lt;link or title&gt; — capture a PDF into the vault',
 	'/grammar &lt;text&gt; — fix grammar and clarity',
 	'/promptgen &lt;goal&gt; — generate a ready-to-use AI prompt',
-	'/broadcast &lt;brief&gt; — draft a WhatsApp broadcast, then /send to actually post it',
-	'/todo &lt;item&gt; / /todo list / /todo done &lt;n&gt; — quick to-do list',
+	'/broadcast &lt;brief&gt; — draft a WhatsApp broadcast, then use the buttons to send or redraft',
+	'/todo &lt;item&gt; / /todo list (✅ buttons) / /todo done &lt;n&gt; — quick to-do list',
 	'/calc &lt;expr or word problem&gt; — calculate (or send a photo of a problem)',
 	'/summarize &lt;text&gt; — summarize pasted text, or /summarize note &lt;n&gt; for a vault entry',
 	'/news &lt;topic&gt; — recent news digest',
@@ -703,6 +748,42 @@ function enqueue(task) {
 	return Promise.resolve()
 		.then(task)
 		.catch((err) => console.error('[bridge] task error:', err));
+}
+
+// Which pending-payload type each callback_data prefix resolves to a
+// handler for. Every button on the bot uses this same dispatch —
+// (chatId, messageId, pendingEntry) in, edits the message in place.
+const CALLBACK_ACTIONS = {
+	bcsend: handleBroadcastSend,
+	bcredraft: handleBroadcastRedraft,
+	tododone: handleTodoDoneButton,
+};
+
+// callback_data is "<action>:<pendingId>" — a short id, never the payload
+// itself (Telegram caps callback_data at 64 bytes; lib/pending.js holds the
+// actual draft/target in .state/pending.json, docs/V2-SPEC.md §1).
+async function handleCallbackQuery(cq) {
+	const chatId = cq.message && cq.message.chat && cq.message.chat.id;
+	const messageId = cq.message && cq.message.message_id;
+	if (chatId !== allowedChatId) return;
+
+	const [action, id] = String(cq.data || '').split(':');
+	const entry = pending.get(id);
+	if (!entry) {
+		await telegram.answerCallbackQuery(cq.id, { text: 'Tombol ini sudah kedaluwarsa.' }).catch(() => {});
+		return;
+	}
+	try {
+		const handler = CALLBACK_ACTIONS[action];
+		if (handler) await handler(chatId, messageId, entry);
+		pending.remove(id);
+		await telegram.answerCallbackQuery(cq.id);
+	} catch (err) {
+		console.error('[bridge] callback query failed:', err.message);
+		pending.remove(id);
+		await telegram.editMessageText(chatId, messageId, `⚠️ ${escapeHtml(err.message)}`).catch(() => {});
+		await telegram.answerCallbackQuery(cq.id, { text: 'Gagal.' }).catch(() => {});
+	}
 }
 
 // Tapping a command in Telegram's menu sends a bare "/cmd" with no argument.
@@ -744,7 +825,7 @@ async function handleMessage(message) {
 
 	if (ARG_PROMPTS[text]) {
 		pendingCommand.set(chatId, text);
-		await telegram.sendMessage(chatId, ARG_PROMPTS[text], { reply_markup: { force_reply: true, selective: true } });
+		await ui.send(chatId, ARG_PROMPTS[text], { reply_markup: { force_reply: true, selective: true } });
 		return;
 	}
 	if (text.startsWith('/')) {
@@ -754,8 +835,12 @@ async function handleMessage(message) {
 		pendingCommand.delete(chatId);
 	}
 
-	if (text === '/start' || text === '/help') {
-		await telegram.sendMessage(chatId, HELP_TEXT);
+	if (text === '/start') {
+		enqueue(() => handleStart(chatId));
+		return;
+	}
+	if (text === '/help') {
+		enqueue(() => ui.send(chatId, HELP_TEXT));
 		return;
 	}
 	if (text === '/list') {
@@ -807,10 +892,6 @@ async function handleMessage(message) {
 		enqueue(() => handleBroadcast(chatId, text.slice('/broadcast'.length).trim()));
 		return;
 	}
-	if (text === '/send') {
-		enqueue(() => handleSend(chatId));
-		return;
-	}
 	if (text === '/confirm') {
 		enqueue(() => handleScheduleConfirm(chatId));
 		return;
@@ -852,7 +933,7 @@ async function handleMessage(message) {
 		return;
 	}
 	if (text.startsWith('/')) {
-		await telegram.sendMessage(chatId, `Unknown command. ${HELP_TEXT}`);
+		await ui.send(chatId, `Unknown command. ${HELP_TEXT}`);
 		return;
 	}
 	enqueue(() => handleIdea(chatId, text));
@@ -861,9 +942,11 @@ async function handleMessage(message) {
 async function pollLoop() {
 	try {
 		await telegram.setMyCommands(BOT_COMMANDS);
-		console.log('[bridge] command menu updated');
+		await telegram.setMyDescription(BOT_DESCRIPTION);
+		await telegram.setMyShortDescription(BOT_SHORT_DESCRIPTION);
+		console.log('[bridge] command menu and description updated');
 	} catch (err) {
-		console.error('[bridge] failed to update command menu:', err.message);
+		console.error('[bridge] failed to update command menu/description:', err.message);
 	}
 
 	let offset = loadOffset();
@@ -875,6 +958,7 @@ async function pollLoop() {
 				offset = update.update_id + 1;
 				saveOffset(offset);
 				if (update.message) handleMessage(update.message).catch((err) => console.error('[bridge] handleMessage error:', err));
+				if (update.callback_query) handleCallbackQuery(update.callback_query).catch((err) => console.error('[bridge] handleCallbackQuery error:', err));
 			}
 		} catch (err) {
 			console.error('[bridge] poll error:', err.message);
@@ -883,7 +967,7 @@ async function pollLoop() {
 	}
 }
 
-module.exports = { handleMessage, pendingCommand, syncVaultQuietly };
+module.exports = { handleMessage, handleCallbackQuery, pendingCommand, syncVaultQuietly };
 
 if (require.main === module) {
 	// One-time migration of pre-.state/ files (bug #7: seen-regulations.json
@@ -901,8 +985,8 @@ if (require.main === module) {
 				const prefix =
 					err.name === 'ScrapeError'
 						? '\u{1F527} <b>Regulation scraper is broken</b>'
-						: '\u26A0\uFE0F <b>Daily regulation check failed</b>';
-				return telegram.sendMessage(allowedChatId, prefix + '\n\n' + escapeHtml(err.message)).catch(() => {});
+						: '⚠️ <b>Daily regulation check failed</b>';
+				return ui.send(allowedChatId, prefix + '\n\n' + escapeHtml(err.message)).catch(() => {});
 			}),
 		),
 	);

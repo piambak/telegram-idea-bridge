@@ -14,8 +14,14 @@ process.env.OPENKNOWLEDGE_DIR = tmpRoot;
 
 const telegram = require('../lib/telegram');
 const sentMsgs = [];
+let nextMessageId = 1;
 telegram.sendMessage = async (chatId, text) => {
 	sentMsgs.push(text);
+	return { message_id: nextMessageId++ };
+};
+telegram.editMessageText = async (chatId, messageId, text) => {
+	sentMsgs.push(text);
+	return { message_id: messageId };
 };
 telegram.sendChatAction = async () => {};
 telegram.setMyCommands = async () => {};

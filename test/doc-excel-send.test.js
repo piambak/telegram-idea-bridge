@@ -9,8 +9,14 @@ const path = require('node:path');
 // existed. /doc and /excel must now send the file back too.
 const telegram = require('../lib/telegram');
 const sent = { messages: [], documents: [] };
+let nextMessageId = 1;
 telegram.sendMessage = async (chatId, text) => {
 	sent.messages.push(text);
+	return { message_id: nextMessageId++ };
+};
+telegram.editMessageText = async (chatId, messageId, text) => {
+	sent.messages.push(text);
+	return { message_id: messageId };
 };
 telegram.sendChatAction = async () => {};
 telegram.setMyCommands = async () => {};

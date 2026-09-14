@@ -1,10 +1,27 @@
 // Self-check: menu tap -> prompt -> next message runs the command with the arg.
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+// /broadcast now creates a lib/pending.js entry (for its buttons) — point
+// .state/ at a tmp dir so that never touches the real repo.
+const tmpStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-bridge-menuargs-state-'));
+process.env.STATE_DIR = tmpStateDir;
+
 const telegram = require('./lib/telegram');
 const { allowedChatId } = require('./lib/config');
 
 const sent = [];
-telegram.sendMessage = async (chatId, text, extra) => { sent.push({ text, extra }); };
+let nextMessageId = 1;
+telegram.sendMessage = async (chatId, text, extra) => {
+	sent.push({ text, extra });
+	return { message_id: nextMessageId++ };
+};
+telegram.editMessageText = async (chatId, messageId, text, extra) => {
+	sent.push({ text, extra });
+	return { message_id: messageId };
+};
 telegram.sendChatAction = async () => {};
 telegram.setMyCommands = async () => {};
 
@@ -37,5 +54,6 @@ const msg = (text) => ({ chat: { id: allowedChatId }, text });
 	await new Promise((r) => setTimeout(r, 50));
 	assert.strictEqual(broadcastCalls.at(-1), 'rapat jam 3', 'inline arg still works');
 
+	fs.rmSync(tmpStateDir, { recursive: true, force: true });
 	console.log('all checks passed');
 })();
