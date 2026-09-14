@@ -21,6 +21,7 @@ const skills = require('./lib/skills');
 const claude = require('./lib/claude');
 const ui = require('./lib/ui');
 const pending = require('./lib/pending');
+const voice = require('./lib/voice');
 const os = require('os');
 const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
@@ -30,6 +31,7 @@ const { escapeHtml } = ui;
 // (docs/V2-SPEC.md §1).
 const BOT_COMMANDS = [
 	{ command: 'start', description: '👋 Apa saja yang bisa bot ini lakukan' },
+	{ command: 'ask', description: '💬 Tanya saja, tidak disimpan: /ask <pertanyaan> (atau awali pesan dengan "?")' },
 	{ command: 'list', description: '📋 Catatan terbaru di vault' },
 	{ command: 'search', description: '🔍 Cari di vault: /search <kata kunci>' },
 	{ command: 'get', description: '📄 Buka hasil nomor: /get <n>' },
@@ -89,23 +91,39 @@ function syncVaultQuietly(message) {
 	return vaultsync.sync(message).catch((err) => console.error('[bridge] vault sync failed:', err.message));
 }
 
+const IDEA_CONFIRM_BELOW_CONFIDENCE = 0.5;
+
+const IDEA_CONFIRM_KEYBOARD = (id) =>
+	ui.keyboard([
+		[
+			{ text: '💾 Simpan', callback_data: `ideasave:${id}` },
+			{ text: '💬 Jawab saja', callback_data: `ideaanswer:${id}` },
+			{ text: '🗑 Buang', callback_data: `ideadiscard:${id}` },
+		],
+	]);
+
+function ideaCardHtml({ title, tags, body, footer }) {
+	return ui.card({ icon: '💡', title, subtitle: (tags || []).map((t) => `#${t}`).join(' '), body, footer });
+}
+
 async function handleIdea(chatId, rawText) {
 	const { modelKey, rest } = parseModelOverride(rawText);
 	const model = MODELS[modelKey];
 	const job = await ui.progress(chatId, `⏳ Enhancing this idea with <b>${escapeHtml(model.label)}</b>...`);
 	startTyping(chatId);
 	try {
-		const { title, tags, body } = await skills.runFast('idea-enhance', rest, model.chat);
+		const { title, tags, body, save_confidence } = await skills.runFast('idea-enhance', rest, model.chat);
+
+		// Chit-chat/questions that don't really belong in the vault get a
+		// choice instead of committing automatically (docs/V2-SPEC.md §1).
+		if (typeof save_confidence === 'number' && save_confidence < IDEA_CONFIRM_BELOW_CONFIDENCE) {
+			const id = pending.create('idea_draft', { title, tags, body, rawIdea: rest });
+			await job.finish(ideaCardHtml({ title, tags, body }), { reply_markup: IDEA_CONFIRM_KEYBOARD(id) });
+			return;
+		}
+
 		const filePath = knowledge.writeIdeaNote({ title, tags, rawIdea: rest, enhancedBody: body });
-		await job.finish(
-			ui.card({
-				icon: '💡',
-				title,
-				subtitle: (tags || []).map((t) => `#${t}`).join(' '),
-				body,
-				footer: `💾 notes/${path.basename(filePath)}`,
-			}),
-		);
+		await job.finish(ideaCardHtml({ title, tags, body, footer: `💾 notes/${path.basename(filePath)}` }));
 		// Fire-and-forget: the note is already saved locally, so a slow (or
 		// failing) push must never delay or fail the reply (docs/ANALYSIS.md
 		// bug #5). syncVaultQuietly itself never rejects.
@@ -115,6 +133,26 @@ async function handleIdea(chatId, rawText) {
 	} finally {
 		stopTyping();
 	}
+}
+
+// [💾 Simpan] — saves the held draft exactly as /todo-free ideas already do.
+async function handleIdeaSave(chatId, messageId, entry) {
+	const { title, tags, body, rawIdea } = entry.data;
+	const filePath = knowledge.writeIdeaNote({ title, tags, rawIdea, enhancedBody: body });
+	await telegram.editMessageText(chatId, messageId, ideaCardHtml({ title, tags, body, footer: `💾 notes/${path.basename(filePath)}` }));
+	syncVaultQuietly(`Add idea: ${title}`);
+}
+
+// [💬 Jawab saja] — shows the already-enhanced take as a plain answer,
+// never saved. Reuses the content from the original call rather than
+// spending a second model call to "answer" the same input again.
+async function handleIdeaAnswerOnly(chatId, messageId, entry) {
+	await telegram.editMessageText(chatId, messageId, escapeHtml(entry.data.body));
+}
+
+// [🗑 Buang] — discards the draft; nothing was ever written to the vault.
+async function handleIdeaDiscard(chatId, messageId) {
+	await telegram.editMessageText(chatId, messageId, '🗑 Dibuang.');
 }
 
 // Generic runner for single-turn fast-tier skills (grammar-fix, prompt-gen):
@@ -265,20 +303,97 @@ async function handleCalc(chatId, argText) {
 	}
 }
 
+// Downloads a Telegram file to a tmp path with a sensible extension —
+// shared by anything that needs the bytes on disk (calc.solveImage reads a
+// path, not a buffer).
+async function downloadToTemp(fileId, prefix) {
+	const file = await telegram.getFile(fileId);
+	const buffer = await telegram.downloadFile(file.file_path);
+	const filePath = path.join(os.tmpdir(), `${prefix}-${Date.now()}${path.extname(file.file_path) || '.jpg'}`);
+	fs.writeFileSync(filePath, buffer);
+	return filePath;
+}
+
 async function handleCalcImage(chatId, fileId) {
 	startTyping(chatId);
 	let imagePath;
 	try {
-		const file = await telegram.getFile(fileId);
-		const buffer = await telegram.downloadFile(file.file_path);
-		imagePath = path.join(os.tmpdir(), `calc-${chatId}-${Date.now()}${path.extname(file.file_path) || '.jpg'}`);
-		fs.writeFileSync(imagePath, buffer);
+		imagePath = await downloadToTemp(fileId, `calc-${chatId}`);
 		const { expression, result } = await calc.solveImage(imagePath);
 		await ui.send(chatId, `<code>${escapeHtml(expression)}</code> = <b>${escapeHtml(result)}</b>`);
 	} catch (err) {
 		await ui.send(chatId, `Calculation failed: ${escapeHtml(err.message)}`);
 	} finally {
 		if (imagePath) fs.unlink(imagePath, () => {});
+		stopTyping();
+	}
+}
+
+// A photo with no caption doesn't say what it's for — offer the two things
+// a photo is for in this bot instead of guessing (docs/V2-SPEC.md §1). The
+// file_id lives in lib/pending.js, not in callback_data — Telegram file_ids
+// routinely run well past the 64-byte callback_data cap on their own.
+async function handlePhotoPrompt(chatId, fileId) {
+	const id = pending.create('photo', { fileId });
+	await telegram.sendMessage(chatId, 'Foto ini untuk apa?', {
+		reply_markup: ui.keyboard([
+			[{ text: '💸 Catat struk', callback_data: `photoreceipt:${id}` }, { text: '🧮 Hitung', callback_data: `photocalc:${id}` }],
+		]),
+	});
+}
+
+// [🧮 Hitung] — same math-photo pipeline as /calc + a photo, edited in place.
+async function handlePhotoCalcButton(chatId, messageId, entry) {
+	await telegram.editMessageText(chatId, messageId, '⏳ Menghitung...');
+	let imagePath;
+	try {
+		imagePath = await downloadToTemp(entry.data.fileId, `calc-${chatId}`);
+		const { expression, result } = await calc.solveImage(imagePath);
+		await telegram.editMessageText(chatId, messageId, `<code>${escapeHtml(expression)}</code> = <b>${escapeHtml(result)}</b>`);
+	} finally {
+		if (imagePath) fs.unlink(imagePath, () => {});
+	}
+}
+
+// [💸 Catat struk] — reads the receipt via the receipt-vision skill (Gemini
+// Flash vision) and shows what it found. There is no finance ledger in this
+// codebase yet (docs/V2-SPEC.md §3 is a separate, later round), so this
+// reads and displays the receipt rather than pretending to log it anywhere.
+async function handlePhotoReceiptButton(chatId, messageId, entry) {
+	await telegram.editMessageText(chatId, messageId, '⏳ Membaca struk...');
+	const file = await telegram.getFile(entry.data.fileId);
+	const buffer = await telegram.downloadFile(file.file_path);
+	const userContent = [
+		{ type: 'text', text: 'Read this receipt and follow the system instructions.' },
+		{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${buffer.toString('base64')}` } },
+	];
+	const data = await skills.runFast('receipt-vision', userContent, MODELS.gemini.chat);
+	const items = (data.items || []).map((it) => `${it.name}: ${it.amount}`);
+	const cardHtml = ui.card({
+		icon: '💸',
+		title: data.merchant || 'Struk',
+		subtitle: data.date || '',
+		sections: items.length ? [{ label: 'Item', items }] : [],
+		footer: `Total: ${data.total ?? '-'}`,
+	});
+	await telegram.editMessageText(chatId, messageId, `${cardHtml}\n\n<i>(belum tersimpan ke catatan keuangan)</i>`);
+}
+
+// Voice note -> Groq Whisper -> handled exactly like typed text (an idea or
+// a command — docs/V2-SPEC.md §1). The transcript is shown first so a
+// misheard word is visible before it's acted on.
+async function handleVoiceNote(chatId, voiceMessage) {
+	const job = await ui.progress(chatId, '⏳ Transcribing voice note...');
+	startTyping(chatId);
+	try {
+		const file = await telegram.getFile(voiceMessage.file_id);
+		const buffer = await telegram.downloadFile(file.file_path);
+		const text = await voice.transcribe(buffer, `voice-${chatId}.ogg`);
+		await job.finish(`🎤 <i>"${escapeHtml(text)}"</i>`);
+		routeText(chatId, text);
+	} catch (err) {
+		await job.finish(`Voice transcription failed: ${escapeHtml(err.message)}`);
+	} finally {
 		stopTyping();
 	}
 }
@@ -587,6 +702,90 @@ async function handleModels(chatId) {
 	);
 }
 
+// Last 3 exchanges (6 messages) per chat for /ask context (docs/V2-SPEC.md
+// §1). In-memory only, like pendingCommand/lastResults elsewhere — losing
+// it on a restart just means the next ask starts a fresh conversation,
+// nothing worth persisting to disk over.
+const askHistory = new Map();
+const ASK_HISTORY_TURNS = 3;
+
+function rememberAskTurn(chatId, userText, assistantText) {
+	const history = askHistory.get(chatId) || [];
+	history.push({ role: 'user', content: userText }, { role: 'assistant', content: assistantText });
+	askHistory.set(chatId, history.slice(-ASK_HISTORY_TURNS * 2));
+}
+
+// "?" prefix or /ask — answers only, never saves anything to the vault
+// (docs/V2-SPEC.md §1). Carries the last 3 turns of /ask-only conversation
+// per chat so a follow-up question makes sense.
+async function handleAsk(chatId, rawText) {
+	if (!rawText) {
+		await ui.send(chatId, 'Usage: /ask &lt;question&gt; (or start a message with "?")');
+		return;
+	}
+	const { modelKey, rest } = parseModelOverride(rawText);
+	const model = MODELS[modelKey];
+	startTyping(chatId);
+	try {
+		const skill = skills.loadSkill('ask');
+		const systemPrompt = skills.renderSkillBody(skill.body, {});
+		const params = {};
+		if (typeof skill.meta.temperature === 'number') params.temperature = skill.meta.temperature;
+		if (typeof skill.meta.max_tokens === 'number') params.max_tokens = skill.meta.max_tokens;
+		const history = askHistory.get(chatId) || [];
+		const messages = [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: rest }];
+		const answer = await model.chat(messages, { params });
+		rememberAskTurn(chatId, rest, answer);
+		await ui.send(chatId, escapeHtml(answer));
+	} catch (err) {
+		await ui.send(chatId, `Ask failed: ${escapeHtml(err.message)}`);
+	} finally {
+		stopTyping();
+	}
+}
+
+// Shared tail of "we have the full text of a document, now capture it" —
+// used by both /pdf (after resolving a URL/title) and a direct PDF upload
+// (docs/V2-SPEC.md §1 "New inputs": message.document goes through the same
+// pipeline as /pdf).
+async function captureDocumentText(job, model, { title, sourceUrl, text }) {
+	const usingClaude = text.length > summarize.CLAUDE_LENGTH_THRESHOLD;
+	await job.update(`⏳ Summarizing (${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`);
+	const summary = await summarize.summarize(text, model.chat, title).catch((err) => {
+		console.error('[bridge] summarize failed:', err.message);
+		return null;
+	});
+	// Deep tier (research-capturer): real tags instead of always [], found
+	// by actually reading the vault for related notes. Best-effort — a
+	// slow/failing capture call must not lose the already-extracted text.
+	const capture = await claude
+		.runSkill('source-capture', title, {
+			stdin: text,
+			schema: skills.schemaFor('source-capture'),
+			agent: 'research-capturer',
+			addDir: knowledgeBaseDir,
+			allowedTools: 'Read,Grep,Glob',
+			timeoutMs: 5 * 60 * 1000,
+		})
+		.catch((err) => {
+			console.error('[bridge] source-capture failed:', err.message);
+			return null;
+		});
+	const tags = capture && capture.ok && Array.isArray(capture.data.tags) ? capture.data.tags : [];
+
+	const { filePath, sidecarPath } = knowledge.writeSourceCapture({
+		title,
+		sourceUrl,
+		tags,
+		extractedText: text, // the full text — writeSourceCapture sidecars it to .txt itself if it's large
+		summary,
+		notes: '',
+	});
+	const summaryLine = summary ? `\n\n${summary}` : '\n\n(summary failed, but the full text was still saved)';
+	const sidecarLine = sidecarPath ? `\n📄 Full text: external-sources/${path.basename(sidecarPath)}` : '';
+	await job.finish(`💾 Captured "${escapeHtml(title)}" to external-sources/${path.basename(filePath)}${sidecarLine}${escapeHtml(summaryLine)}`);
+}
+
 async function handlePdf(chatId, rawInput) {
 	if (!rawInput) {
 		await ui.send(chatId, 'Usage: /pdf (link or document title)');
@@ -601,43 +800,39 @@ async function handlePdf(chatId, rawInput) {
 		await job.update(`⏳ Found: ${escapeHtml(url)}\nDownloading and extracting text...`);
 		const { buffer, finalUrl } = await pdf.fetchPdfBuffer(url);
 		const text = await pdf.extractText(buffer);
-
 		const title = input.length < 80 && !pdf.isUrl(input) ? input : finalUrl.split('/').pop() || 'PDF Source';
-		const usingClaude = text.length > summarize.CLAUDE_LENGTH_THRESHOLD;
-		await job.update(`⏳ Summarizing (${text.length.toLocaleString()} chars) with ${usingClaude ? 'Claude CLI' : escapeHtml(model.label)}...`);
-		const summary = await summarize.summarize(text, model.chat, title).catch((err) => {
-			console.error('[bridge] summarize failed:', err.message);
-			return null;
-		});
-		// Deep tier (research-capturer): real tags instead of always [], found
-		// by actually reading the vault for related notes. Best-effort — a
-		// slow/failing capture call must not lose the already-extracted text.
-		const capture = await claude
-			.runSkill('source-capture', title, {
-				stdin: text,
-				schema: skills.schemaFor('source-capture'),
-				agent: 'research-capturer',
-				addDir: knowledgeBaseDir,
-				allowedTools: 'Read,Grep,Glob',
-				timeoutMs: 5 * 60 * 1000,
-			})
-			.catch((err) => {
-				console.error('[bridge] source-capture failed:', err.message);
-				return null;
-			});
-		const tags = capture && capture.ok && Array.isArray(capture.data.tags) ? capture.data.tags : [];
+		await captureDocumentText(job, model, { title, sourceUrl: finalUrl, text });
+	} catch (err) {
+		await job.finish(`PDF capture failed: ${escapeHtml(err.message)}`);
+	} finally {
+		stopTyping();
+	}
+}
 
-		const { filePath, sidecarPath } = knowledge.writeSourceCapture({
-			title,
-			sourceUrl: finalUrl,
-			tags,
-			extractedText: text, // the full text — writeSourceCapture sidecars it to .txt itself if it's large
-			summary,
-			notes: '',
-		});
-		const summaryLine = summary ? `\n\n${summary}` : '\n\n(summary failed, but the full text was still saved)';
-		const sidecarLine = sidecarPath ? `\n📄 Full text: external-sources/${path.basename(sidecarPath)}` : '';
-		await job.finish(`💾 Captured "${escapeHtml(title)}" to external-sources/${path.basename(filePath)}${sidecarLine}${escapeHtml(summaryLine)}`);
+// A PDF sent as a Telegram file (not a link/title) — same capture pipeline
+// as /pdf, just skipping the lookup/download-from-URL step since we already
+// have the bytes. .docx uploads are deliberately out of scope this round
+// (docs/V2-SPEC.md "Later").
+async function handleDocumentUpload(chatId, document) {
+	const filename = document.file_name || 'document.pdf';
+	const isPdf = document.mime_type === 'application/pdf' || /\.pdf$/i.test(filename);
+	if (!isPdf) {
+		await ui.send(
+			chatId,
+			`Saat ini hanya file PDF yang bisa langsung diunggah (${escapeHtml(filename)} bukan PDF). Untuk membuat dokumen baru, coba /doc.`,
+		);
+		return;
+	}
+	const model = MODELS[DEFAULT_MODEL];
+	const job = await ui.progress(chatId, `⏳ Downloading "${escapeHtml(filename)}"...`);
+	startTyping(chatId);
+	try {
+		const file = await telegram.getFile(document.file_id);
+		const buffer = await telegram.downloadFile(file.file_path);
+		await job.update('⏳ Extracting text...');
+		const text = await pdf.extractText(buffer);
+		const title = filename.replace(/\.pdf$/i, '') || 'PDF Source';
+		await captureDocumentText(job, model, { title, sourceUrl: '', text });
 	} catch (err) {
 		await job.finish(`PDF capture failed: ${escapeHtml(err.message)}`);
 	} finally {
@@ -714,11 +909,14 @@ async function handleStart(chatId) {
 const HELP_TEXT = [
 	"Send me any idea and I'll enhance it (default model: Groq) and save it to your knowledge base.",
 	'Override the model for one message: "&lt;model&gt;: your idea", e.g. "groq: summarize this trend".',
+	'A low-confidence idea (looks like chit-chat, not something worth saving) asks first instead of saving automatically.',
+	'Send a PDF file, a voice note, or a photo — they\'re all handled too (see below).',
 	'',
+	'?&lt;question&gt; or /ask &lt;question&gt; — answer only, never saved, remembers the last 3 turns',
 	'/list — recent vault entries',
 	'/search &lt;query&gt; — search your vault',
 	'/get &lt;n&gt; — open a result from /list or /search',
-	'/pdf &lt;link or title&gt; — capture a PDF into the vault',
+	'/pdf &lt;link or title&gt; — capture a PDF into the vault (or just send the PDF file directly)',
 	'/grammar &lt;text&gt; — fix grammar and clarity',
 	'/promptgen &lt;goal&gt; — generate a ready-to-use AI prompt',
 	'/broadcast &lt;brief&gt; — draft a WhatsApp broadcast, then use the buttons to send or redraft',
@@ -757,6 +955,11 @@ const CALLBACK_ACTIONS = {
 	bcsend: handleBroadcastSend,
 	bcredraft: handleBroadcastRedraft,
 	tododone: handleTodoDoneButton,
+	ideasave: handleIdeaSave,
+	ideaanswer: handleIdeaAnswerOnly,
+	ideadiscard: handleIdeaDiscard,
+	photocalc: handlePhotoCalcButton,
+	photoreceipt: handlePhotoReceiptButton,
 };
 
 // callback_data is "<action>:<pendingId>" — a short id, never the payload
@@ -790,6 +993,7 @@ async function handleCallbackQuery(cq) {
 // Instead of answering with a usage line, remember the command and treat the
 // next plain message as its argument — click the menu, then just type the text.
 const ARG_PROMPTS = {
+	'/ask': 'What would you like to ask? (answered only, never saved)',
 	'/search': 'What should I search the vault for?',
 	'/get': 'Which result number? (from the last /list or /search)',
 	'/pdf': 'Send the PDF link or the document title.',
@@ -816,7 +1020,23 @@ async function handleMessage(message) {
 		if (caption && !caption.startsWith('/calc')) return; // photo for some other purpose, ignore
 		pendingCommand.delete(chatId);
 		const largest = message.photo[message.photo.length - 1];
+		if (!caption) {
+			// No caption at all -> we don't know what it's for; ask
+			// (docs/V2-SPEC.md §1 "New inputs").
+			enqueue(() => handlePhotoPrompt(chatId, largest.file_id));
+			return;
+		}
 		enqueue(() => handleCalcImage(chatId, largest.file_id));
+		return;
+	}
+	if (message.document) {
+		pendingCommand.delete(chatId);
+		enqueue(() => handleDocumentUpload(chatId, message.document));
+		return;
+	}
+	if (message.voice) {
+		pendingCommand.delete(chatId);
+		enqueue(() => handleVoiceNote(chatId, message.voice));
 		return;
 	}
 
@@ -835,12 +1055,28 @@ async function handleMessage(message) {
 		pendingCommand.delete(chatId);
 	}
 
+	routeText(chatId, text);
+}
+
+// The command/idea dispatch, factored out of handleMessage so a voice
+// transcript can be routed through exactly the same logic as typed text
+// (docs/V2-SPEC.md §1: a voice note "can be an idea OR a command").
+function routeText(chatId, text) {
+	// "?" prefix -> /ask (answer only, never saves) — docs/V2-SPEC.md §1.
+	if (text.startsWith('?')) {
+		enqueue(() => handleAsk(chatId, text.slice(1).trim()));
+		return;
+	}
 	if (text === '/start') {
 		enqueue(() => handleStart(chatId));
 		return;
 	}
 	if (text === '/help') {
 		enqueue(() => ui.send(chatId, HELP_TEXT));
+		return;
+	}
+	if (text.startsWith('/ask')) {
+		enqueue(() => handleAsk(chatId, text.slice('/ask'.length).trim()));
 		return;
 	}
 	if (text === '/list') {
@@ -933,7 +1169,7 @@ async function handleMessage(message) {
 		return;
 	}
 	if (text.startsWith('/')) {
-		await ui.send(chatId, `Unknown command. ${HELP_TEXT}`);
+		enqueue(() => ui.send(chatId, `Unknown command. ${HELP_TEXT}`));
 		return;
 	}
 	enqueue(() => handleIdea(chatId, text));
