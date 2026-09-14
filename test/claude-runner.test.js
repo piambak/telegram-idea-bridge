@@ -220,3 +220,40 @@ test('runSkill with no args still produces a valid "/<name>" header', async (t) 
 	child.emit('close', 0);
 	await resultPromise;
 });
+
+// --- version() — /status's cheap liveness check ---------------------------
+
+test('version(): resolves with stdout on a clean exit, never writes to stdin', async (t) => {
+	const child = fakeChild();
+	let seenArgs;
+	t.mock.method(cp, 'spawn', (bin, args) => {
+		seenArgs = args;
+		return child;
+	});
+
+	const resultPromise = claude.version();
+	assert.deepStrictEqual(seenArgs, ['--version']);
+	assert.deepStrictEqual(child.stdin.chunks, [], 'version() has no prompt to send');
+
+	child.stdout.emit('data', Buffer.from('2.1.0 (Claude Code)\n'));
+	child.emit('close', 0);
+	assert.strictEqual(await resultPromise, '2.1.0 (Claude Code)');
+});
+
+test('version(): a non-zero exit rejects with a clear message', async (t) => {
+	const child = fakeChild();
+	t.mock.method(cp, 'spawn', () => child);
+
+	const resultPromise = claude.version();
+	child.emit('close', 1);
+	await assert.rejects(resultPromise, /exited 1/);
+});
+
+test('version(): the binary failing to start (not on PATH) rejects instead of hanging', async (t) => {
+	const child = fakeChild();
+	t.mock.method(cp, 'spawn', () => child);
+
+	const resultPromise = claude.version();
+	child.emit('error', new Error('ENOENT'));
+	await assert.rejects(resultPromise, /Failed to start Claude CLI/);
+});

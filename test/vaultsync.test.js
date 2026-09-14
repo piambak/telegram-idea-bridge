@@ -91,3 +91,90 @@ test('one sync() rejecting does not jam the queue for the next call', async (t) 
 	await assert.doesNotReject(() => vaultsync.sync('should still work'));
 	assert.strictEqual(getMaxActive(), 1);
 });
+
+// docs/V2-SPEC.md §6: every scheduled job (regcheck, reminder tick, inbox
+// digest, monthly finance report) is serialised against this same mutex, not
+// just vaultsync's own git commands — serialized() must work as a general
+// one-at-a-time queue for arbitrary async tasks, sync() included.
+test('serialized: is a general-purpose mutex — arbitrary tasks never overlap each other', async () => {
+	let active = 0;
+	let maxActive = 0;
+	const order = [];
+	const task = (label, delayMs) => async () => {
+		active++;
+		maxActive = Math.max(maxActive, active);
+		await new Promise((r) => setTimeout(r, delayMs));
+		order.push(label);
+		active--;
+	};
+
+	await Promise.all([vaultsync.serialized(task('a', 15)), vaultsync.serialized(task('b', 5)), vaultsync.serialized(task('c', 1))]);
+
+	assert.strictEqual(maxActive, 1, 'no two serialized tasks should ever run concurrently');
+	assert.deepStrictEqual(order, ['a', 'b', 'c'], 'tasks run in call order, not completion-speed order');
+});
+
+test('serialized: shares the exact same queue sync() uses — a job queued after a sync waits for it', async (t) => {
+	const { calls } = stubGit(t, { delayMs: 15 });
+	const order = [];
+
+	await Promise.all([
+		vaultsync.sync('a job-adjacent commit').then(() => order.push('sync')),
+		vaultsync.serialized(async () => {
+			order.push('job');
+		}),
+	]);
+
+	assert.deepStrictEqual(order, ['sync', 'job'], 'a job queued alongside a sync must not run until the sync has settled');
+	assert.strictEqual(calls.length, 4, 'the sync\'s own git commands are unaffected by having a job queued behind it');
+});
+
+// --- checkConnection() — /status's "vault mirror" row ----------------------
+
+test('checkConnection: a real remote round-trip succeeds when the dir exists and there is no recorded failure', async (t) => {
+	stubGit(t, { delayMs: 1 });
+	const result = await vaultsync.checkConnection();
+	assert.strictEqual(result.ok, true);
+});
+
+test('checkConnection: a missing vault directory is reported without ever touching git', async (t) => {
+	t.mock.method(cp, 'execFile', () => {
+		throw new Error('must not shell out when the vault dir itself is missing');
+	});
+	// VAULT_DIR is a fixed path read once at module load, so this exercises
+	// the fs.existsSync branch by actually removing (then restoring) it.
+	fs.rmSync(vaultDir, { recursive: true, force: true });
+	try {
+		const result = await vaultsync.checkConnection();
+		assert.strictEqual(result.ok, false);
+		assert.match(result.reason, /vault directory not found/);
+	} finally {
+		fs.mkdirSync(vaultDir, { recursive: true });
+	}
+});
+
+test('checkConnection: a recorded sync failure is surfaced without a fresh network call', async (t) => {
+	stubGit(t, { failOn: 'push' });
+	await assert.rejects(() => vaultsync.sync('will fail'));
+
+	t.mock.method(cp, 'execFile', () => {
+		throw new Error('must not call git again — the recorded failure should short-circuit');
+	});
+	const result = await vaultsync.checkConnection();
+	assert.strictEqual(result.ok, false);
+	assert.match(result.reason, /last sync failed/);
+
+	t.mock.reset();
+	stubGit(t);
+	await vaultsync.sync('recovers'); // clears lastError for later tests
+});
+
+test('checkConnection: an unreachable remote (ls-remote fails) is reported by message', async (t) => {
+	t.mock.method(cp, 'execFile', (file, args, opts, cb) => {
+		if (args[0] === 'ls-remote') return cb(new Error('unable to access remote'), '', 'unable to access remote');
+		cb(null, 'main\n', '');
+	});
+	const result = await vaultsync.checkConnection();
+	assert.strictEqual(result.ok, false);
+	assert.match(result.reason, /unable to access remote/);
+});

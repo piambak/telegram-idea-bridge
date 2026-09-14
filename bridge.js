@@ -24,6 +24,9 @@ const pending = require('./lib/pending');
 const voice = require('./lib/voice');
 const finance = require('./lib/finance');
 const reminders = require('./lib/reminders');
+const mail = require('./lib/mail');
+const digest = require('./lib/digest');
+const status = require('./lib/status');
 const os = require('os');
 const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
@@ -55,6 +58,7 @@ const BOT_COMMANDS = [
 	{ command: 'spend', description: '💸 Catat transaksi: /spend <deskripsi + jumlah>' },
 	{ command: 'report', description: '📊 Laporan keuangan: /report atau /report YYYY-MM' },
 	{ command: 'remind', description: '🔔 Pengingat: /remind <teks>, list, done <n>, del <n>, check' },
+	{ command: 'status', description: '🩺 Layanan mana yang terhubung' },
 	{ command: 'models', description: '🤖 Daftar model AI yang tersedia' },
 	{ command: 'help', description: '❓ Daftar lengkap perintah' },
 ];
@@ -672,6 +676,60 @@ async function handleRemind(chatId, argText) {
 	}
 }
 
+// ---- Inbox digest (docs/V2-SPEC.md §2, §6) -------------------------------
+
+function digestItemLine(item) {
+	if (item.category === 'finance' && item.transaction) {
+		const flag = item.autoLogged ? ' — ✅ dicatat' : item.autoLogError ? ' — ⚠️ gagal dicatat' : '';
+		return `${item.transaction.description} — ${formatRupiah(item.transaction.amount)}${flag}`;
+	}
+	if (item.category === 'meeting') {
+		const flag = item.autoCalendared ? ' — ✅ di kalender' : item.autoCalendarError ? ' — ⚠️ gagal ke kalender' : '';
+		return `${item.summary}${flag}`;
+	}
+	if (item.category === 'action') {
+		const due = item.due ? ` (jatuh tempo ${item.due})` : '';
+		return `${item.summary}${item.action ? ` — ${item.action}` : ''}${due}`;
+	}
+	return item.summary;
+}
+
+const DIGEST_QUIET_CATEGORIES = new Set(['newsletter', 'system']);
+
+// Groups get folded into one main card, except newsletter/system which stay
+// collapsed-by-default sections (docs/V2-SPEC.md §1 quietSection) — the
+// whole point of triaging those out is not to make them loud again here.
+function renderDigestHtml(groups, errors) {
+	const hot = groups.filter((g) => !DIGEST_QUIET_CATEGORIES.has(g.category));
+	const quiet = groups.filter((g) => DIGEST_QUIET_CATEGORIES.has(g.category));
+	const sections = hot.map((g) => ({ label: g.label, items: g.items.map(digestItemLine) }));
+	const footer = errors && errors.length ? errors.map((e) => `⚠️ ${e.provider}: ${e.message}`).join('; ') : undefined;
+	const mainCard = ui.card({ icon: '📬', title: 'Inbox digest', sections, footer });
+	const quietBlocks = quiet.map((g) => ui.quietSection(g.label, g.items.map(digestItemLine)));
+	return [mainCard, ...quietBlocks].join('\n\n');
+}
+
+// One run of the pipeline: mail.fetchNew -> digest.triage -> autoActions ->
+// a rendered card. Silent when there is nothing new AND no provider error —
+// a scheduled run must not post an empty "nothing happened" message every
+// time (docs/V2-SPEC.md §2 "quiet if nothing new"). A provider failing
+// (bad token, network blip) still gets a heads-up even with zero messages,
+// since that's the one case where silence would hide a real problem.
+async function runInboxDigest({ overrideHours } = {}) {
+	const { messages, errors } = await mail.fetchNew({ overrideHours });
+	if (messages.length === 0) {
+		if (errors.length === 0) return { sent: false, count: 0, errors };
+		await ui.send(allowedChatId, ui.card({ icon: '📬', title: 'Inbox digest', footer: errors.map((e) => `⚠️ ${e.provider}: ${e.message}`).join('; ') }));
+		return { sent: true, count: 0, errors };
+	}
+	const model = MODELS[DEFAULT_MODEL];
+	const triaged = await digest.triage(messages, model.chat);
+	await digest.autoActions(triaged);
+	const groups = digest.groupByCategory(triaged);
+	await ui.send(allowedChatId, renderDigestHtml(groups, errors));
+	return { sent: true, count: messages.length, errors };
+}
+
 // Voice note -> Groq Whisper -> handled exactly like typed text (an idea or
 // a command — docs/V2-SPEC.md §1). The transcript is shown first so a
 // misheard word is visible before it's acted on.
@@ -995,6 +1053,22 @@ async function handleModels(chatId) {
 	);
 }
 
+// docs/V2-SPEC.md §9: the single command to tell what's actually configured
+// and reachable on the PC (Phase 5). Real live checks (a minimal chat call,
+// a live token refresh, a real connection attempt) — not just "is the env
+// var set" — so a revoked token or a dead office-PC service shows up here,
+// not just a missing key.
+async function handleStatus(chatId) {
+	const job = await ui.progress(chatId, '⏳ Mengecek status...');
+	try {
+		const results = await status.checkAll();
+		const items = results.map((r) => (r.ok ? `✅ ${r.name}` : `❌ ${r.name} — ${r.reason}`));
+		await job.finish(ui.card({ icon: '🩺', title: 'Status', sections: [{ items }] }));
+	} catch (err) {
+		await job.finish(`Gagal mengecek status: ${escapeHtml(err.message)}`);
+	}
+}
+
 // Last 3 exchanges (6 messages) per chat for /ask context (docs/V2-SPEC.md
 // §1). In-memory only, like pendingCommand/lastResults elsewhere — losing
 // it on a restart just means the next ask starts a fresh conversation,
@@ -1230,6 +1304,7 @@ const HELP_TEXT = [
 	'/report or /report YYYY-MM — income/expense/net for a month (auto-sent on the 1st at 08:00 WIB for the previous month)',
 	'/remind &lt;text&gt; — add a recurring reminder; /remind list, done &lt;n&gt;, del &lt;n&gt;, check (checked automatically daily at 07:15 WIB)',
 	'/models — list available models and overrides',
+	'/status — which services (Groq/OpenRouter/Ollama Cloud/Gemini, Claude CLI, Google/Microsoft tokens, IMAP, Radicale, hermes, vault mirror) are reachable right now',
 	'/help — this message',
 ].join('\n');
 
@@ -1418,6 +1493,10 @@ function routeText(chatId, text) {
 		enqueue(() => handleModels(chatId));
 		return;
 	}
+	if (text === '/status') {
+		enqueue(() => handleStatus(chatId));
+		return;
+	}
 	if (text.startsWith('/grammar')) {
 		enqueue(() =>
 			runSkillJob(chatId, text.slice('/grammar'.length).trim(), {
@@ -1502,6 +1581,32 @@ function routeText(chatId, text) {
 	enqueue(() => handleIdea(chatId, text));
 }
 
+// Minute-granular sibling of lib/regmonitor.js's scheduleDaily/
+// msUntilNextWibHour, for the 07:30 inbox digest (docs/V2-SPEC.md §6) —
+// the only scheduled job here that isn't on the hour.
+function msUntilNextWibTime(hour, minute) {
+	const WIB_OFFSET_MS = 7 * 3600 * 1000;
+	const nowUtc = Date.now();
+	const nowWib = new Date(nowUtc + WIB_OFFSET_MS);
+	const targetUtc = Date.UTC(nowWib.getUTCFullYear(), nowWib.getUTCMonth(), nowWib.getUTCDate(), hour, minute, 0) - WIB_OFFSET_MS;
+	return targetUtc > nowUtc ? targetUtc - nowUtc : targetUtc + 24 * 3600 * 1000 - nowUtc;
+}
+
+function scheduleDailyAt(hourWib, minuteWib, callback) {
+	const run = () => {
+		callback().catch((err) => console.error('[bridge] scheduled job failed:', err.message));
+		setTimeout(run, msUntilNextWibTime(hourWib, minuteWib));
+	};
+	setTimeout(run, msUntilNextWibTime(hourWib, minuteWib));
+}
+
+// The optional INBOX_EVERY_HOURS extra digest — a plain fixed-interval
+// timer rather than WIB-wall-clock-aligned, since "every N hours" is
+// relative to when the bot started, not to a specific time of day.
+function scheduleEveryHours(hours, callback) {
+	setInterval(() => callback().catch((err) => console.error('[bridge] scheduled job failed:', err.message)), hours * 3600 * 1000);
+}
+
 async function pollLoop() {
 	try {
 		await telegram.setMyCommands(BOT_COMMANDS);
@@ -1530,7 +1635,7 @@ async function pollLoop() {
 	}
 }
 
-module.exports = { handleMessage, handleCallbackQuery, pendingCommand, syncVaultQuietly };
+module.exports = { handleMessage, handleCallbackQuery, pendingCommand, syncVaultQuietly, runInboxDigest };
 
 if (require.main === module) {
 	// One-time migration of pre-.state/ files (bug #7: seen-regulations.json
@@ -1539,11 +1644,22 @@ if (require.main === module) {
 	state.migrateLegacyFile(path.join(__dirname, '.offset'), 'offset');
 	state.migrateLegacyFile(path.join(__dirname, 'seen-regulations.json'), 'seen-regulations.json');
 
+	// docs/V2-SPEC.md §6: every scheduled job below is serialised against the
+	// vault mutex (vaultsync.serialized — the same queue sync() itself uses),
+	// so an unattended job can never race a vault sync or another job over
+	// the same working tree / .state files. enqueue()'s own catch, this
+	// wrapper's inner catch, and each scheduleX()'s own catch are three
+	// redundant safety nets — an unhandled rejection in a background job must
+	// never reach the process and take the poll loop down with it.
+	function runScheduledJob(task) {
+		return enqueue(() => vaultsync.serialized(task));
+	}
+
 	// The daily run is unattended, so its failures must reach Telegram rather
 	// than only the log - a broken scraper otherwise looks exactly like a quiet
-	// news day. enqueue() swallows errors by design, so catch before it does.
+	// news day.
 	regmonitor.scheduleDaily(7, () =>
-		enqueue(() =>
+		runScheduledJob(() =>
 			runRegulationCheck(allowedChatId, { announceNoChange: false, modelKey: modelForJob('regcheck') }).catch((err) => {
 				const prefix =
 					err.name === 'ScrapeError'
@@ -1555,10 +1671,36 @@ if (require.main === module) {
 	);
 	console.log('[bridge] regulation monitor scheduled for 07:00 WIB daily');
 
+	// Daily 07:15 WIB: create Google Tasks for reminders entering their lead
+	// window, nudge due/overdue ones, and detect phone-side completions
+	// (docs/V2-SPEC.md §4).
+	reminders.scheduleDailyTick(7, 15, () =>
+		runScheduledJob(() =>
+			runReminderTick().catch((err) => ui.send(allowedChatId, `⚠️ <b>Pengecekan pengingat gagal</b>\n\n${escapeHtml(err.message)}`).catch(() => {})),
+		),
+	);
+	console.log('[bridge] reminder tick scheduled for 07:15 WIB daily');
+
+	// Daily 07:30 WIB: inbox digest, quiet when there's nothing new
+	// (docs/V2-SPEC.md §2, §6). Plus an optional extra digest every
+	// INBOX_EVERY_HOURS hours, e.g. for someone who wants a midday check too.
+	scheduleDailyAt(7, 30, () =>
+		runScheduledJob(() => runInboxDigest().catch((err) => ui.send(allowedChatId, `⚠️ <b>Inbox digest gagal</b>\n\n${escapeHtml(err.message)}`).catch(() => {}))),
+	);
+	console.log('[bridge] inbox digest scheduled for 07:30 WIB daily');
+
+	const inboxEveryHours = Number(env.INBOX_EVERY_HOURS) || 0;
+	if (inboxEveryHours > 0) {
+		scheduleEveryHours(inboxEveryHours, () =>
+			runScheduledJob(() => runInboxDigest().catch((err) => ui.send(allowedChatId, `⚠️ <b>Inbox digest gagal</b>\n\n${escapeHtml(err.message)}`).catch(() => {}))),
+		);
+		console.log(`[bridge] extra inbox digest scheduled every ${inboxEveryHours}h`);
+	}
+
 	// 1st of the month, 08:00 WIB: auto-send last month's finance report
 	// (docs/V2-SPEC.md §3), same as the /report flow but unprompted.
 	finance.scheduleMonthlyReport(8, () =>
-		enqueue(async () => {
+		runScheduledJob(async () => {
 			const monthKey = finance.previousMonthKey(new Date().toISOString().slice(0, 7));
 			try {
 				const model = MODELS[DEFAULT_MODEL];
@@ -1571,16 +1713,6 @@ if (require.main === module) {
 		}),
 	);
 	console.log('[bridge] monthly finance report scheduled for the 1st at 08:00 WIB');
-
-	// Daily 07:15 WIB: create Google Tasks for reminders entering their lead
-	// window, nudge due/overdue ones, and detect phone-side completions
-	// (docs/V2-SPEC.md §4).
-	reminders.scheduleDailyTick(7, 15, () =>
-		enqueue(() =>
-			runReminderTick().catch((err) => ui.send(allowedChatId, `⚠️ <b>Pengecekan pengingat gagal</b>\n\n${escapeHtml(err.message)}`).catch(() => {})),
-		),
-	);
-	console.log('[bridge] reminder tick scheduled for 07:15 WIB daily');
 
 	pollLoop();
 }

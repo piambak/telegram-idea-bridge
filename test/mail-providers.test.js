@@ -113,3 +113,85 @@ test('requiring lib/mail/imap.js never fails even though imapflow/mailparser are
 test('imap.loadImapDeps() throws a clear, actionable error since imapflow/mailparser are not installed in this repo', () => {
 	assert.throws(() => imap.loadImapDeps(), /imapflow\/mailparser not installed/);
 });
+
+// --- checkConnection() / status() — /status's IMAP and Microsoft rows -----
+
+test('imap.checkConnection(): not configured is reported without touching imapflow/mailparser', async () => {
+	const result = await imap.checkConnection();
+	assert.strictEqual(result.ok, false);
+	assert.match(result.reason, /Not configured.*IMAP_HOST/);
+});
+
+test('imap.checkConnection(): configured but imapflow/mailparser missing surfaces that specific reason', async () => {
+	const saved = { host: env.IMAP_HOST, user: env.IMAP_USER, pass: env.IMAP_PASSWORD };
+	Object.assign(env, { IMAP_HOST: 'imap.example.com', IMAP_USER: 'me', IMAP_PASSWORD: 'secret' });
+	try {
+		const result = await imap.checkConnection();
+		assert.strictEqual(result.ok, false);
+		assert.match(result.reason, /imapflow\/mailparser not installed/);
+	} finally {
+		Object.assign(env, { IMAP_HOST: saved.host, IMAP_USER: saved.user, IMAP_PASSWORD: saved.pass });
+	}
+});
+
+test('outlook.status(): not configured (no MS_CLIENT_ID) is reported without touching the token file', async () => {
+	const saved = env.MS_CLIENT_ID;
+	delete env.MS_CLIENT_ID;
+	try {
+		const result = await outlook.status();
+		assert.deepStrictEqual(result, { connected: false, ok: false, message: 'Not configured — set MS_CLIENT_ID (see docs/SETUP-OUTLOOK.md)' });
+	} finally {
+		env.MS_CLIENT_ID = saved;
+	}
+});
+
+test('outlook.status(): configured but never connected (no token file)', async () => {
+	const savedId = env.MS_CLIENT_ID;
+	const savedPath = env.MS_TOKEN_PATH;
+	env.MS_CLIENT_ID = 'client-id';
+	env.MS_TOKEN_PATH = path.join(tmpRoot, 'no-such-ms-token-2.json');
+	try {
+		const result = await outlook.status();
+		assert.strictEqual(result.connected, false);
+		assert.match(result.message, /setup-outlook/);
+	} finally {
+		env.MS_CLIENT_ID = savedId;
+		env.MS_TOKEN_PATH = savedPath;
+	}
+});
+
+test('outlook.status(): a valid token refreshes live and reports "token OK"', async (t) => {
+	const tokenFile = path.join(tmpRoot, 'ms-token-status.json');
+	fs.writeFileSync(tokenFile, JSON.stringify({ access_token: 'stale', refresh_token: 'r1', expiry_date: Date.now() - 1000 }));
+	const savedId = env.MS_CLIENT_ID;
+	const savedPath = env.MS_TOKEN_PATH;
+	env.MS_CLIENT_ID = 'client-id';
+	env.MS_TOKEN_PATH = tokenFile;
+	t.mock.method(global, 'fetch', async () => ({ ok: true, json: async () => ({ access_token: 'fresh', expires_in: 3600 }) }));
+	try {
+		const result = await outlook.status();
+		assert.deepStrictEqual(result, { connected: true, ok: true, message: 'token OK' });
+	} finally {
+		env.MS_CLIENT_ID = savedId;
+		env.MS_TOKEN_PATH = savedPath;
+	}
+});
+
+test('outlook.status(): a rejected refresh (revoked token) is reported, connected but not ok', async (t) => {
+	const tokenFile = path.join(tmpRoot, 'ms-token-status-bad.json');
+	fs.writeFileSync(tokenFile, JSON.stringify({ access_token: 'stale', refresh_token: 'r1', expiry_date: Date.now() - 1000 }));
+	const savedId = env.MS_CLIENT_ID;
+	const savedPath = env.MS_TOKEN_PATH;
+	env.MS_CLIENT_ID = 'client-id';
+	env.MS_TOKEN_PATH = tokenFile;
+	t.mock.method(global, 'fetch', async () => ({ ok: false, status: 400, text: async () => 'invalid_grant' }));
+	try {
+		const result = await outlook.status();
+		assert.strictEqual(result.connected, true);
+		assert.strictEqual(result.ok, false);
+		assert.match(result.message, /invalid_grant/);
+	} finally {
+		env.MS_CLIENT_ID = savedId;
+		env.MS_TOKEN_PATH = savedPath;
+	}
+});

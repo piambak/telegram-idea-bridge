@@ -40,3 +40,20 @@ test('a genuine success resolves with the bridge response', async (t) => {
 	const result = await whatsapp.sendToGroup('hello');
 	assert.deepStrictEqual(result, { success: true, messageId: 'abc' });
 });
+
+// --- checkConnection() — /status's "hermes" row ---------------------------
+
+test('checkConnection: any HTTP response at all means the bridge process is up, even a 404', async (t) => {
+	t.mock.method(global, 'fetch', async () => ({ ok: false, status: 404 }));
+	const result = await whatsapp.checkConnection();
+	assert.strictEqual(result.ok, true);
+});
+
+test('checkConnection: a connection failure (process not running) is reported by message', async (t) => {
+	t.mock.method(global, 'fetch', async () => {
+		throw new Error('fetch failed: ECONNREFUSED');
+	});
+	const result = await whatsapp.checkConnection();
+	assert.strictEqual(result.ok, false);
+	assert.match(result.reason, /ECONNREFUSED/);
+});
