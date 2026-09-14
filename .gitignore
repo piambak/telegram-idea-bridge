@@ -7,3 +7,7 @@ node_modules/
 .offset
 .state/
 seen-regulations.json
+
+# OAuth tokens (docs/SETUP-GOOGLE.md, docs/SETUP-OUTLOOK.md)
+.google-token.json
+.ms-token.json
