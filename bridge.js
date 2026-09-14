@@ -18,6 +18,7 @@ const docgen = require('./lib/docgen');
 const regmonitor = require('./lib/regmonitor');
 const images = require('./lib/images');
 const vaultsync = require('./lib/vaultsync');
+const state = require('./lib/state');
 const os = require('os');
 const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
@@ -45,18 +46,14 @@ const BOT_COMMANDS = [
 	{ command: 'help', description: 'Show available commands' },
 ];
 
-const OFFSET_FILE = path.join(__dirname, '.offset');
+const OFFSET_STATE_FILE = 'offset';
 
 function loadOffset() {
-	try {
-		return Number(fs.readFileSync(OFFSET_FILE, 'utf8').trim()) || 0;
-	} catch {
-		return 0;
-	}
+	return state.readJson(OFFSET_STATE_FILE, 0);
 }
 
 function saveOffset(offset) {
-	fs.writeFileSync(OFFSET_FILE, String(offset), 'utf8');
+	state.writeJson(OFFSET_STATE_FILE, offset);
 }
 
 // Keep-alive typing indicator while a job runs. Refcounted: jobs now run
@@ -824,6 +821,12 @@ async function pollLoop() {
 module.exports = { handleMessage, pendingCommand };
 
 if (require.main === module) {
+	// One-time migration of pre-.state/ files (bug #7: seen-regulations.json
+	// used to live at the repo root, tracked in git and rewritten daily).
+	// A no-op once each file has been moved once, so this is safe on every boot.
+	state.migrateLegacyFile(path.join(__dirname, '.offset'), 'offset');
+	state.migrateLegacyFile(path.join(__dirname, 'seen-regulations.json'), 'seen-regulations.json');
+
 	// The daily run is unattended, so its failures must reach Telegram rather
 	// than only the log - a broken scraper otherwise looks exactly like a quiet
 	// news day. enqueue() swallows errors by design, so catch before it does.

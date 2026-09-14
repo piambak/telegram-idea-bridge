@@ -5,3 +5,5 @@ node_modules/
 *.log
 *.log.new
 .offset
+.state/
+seen-regulations.json
