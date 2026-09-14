@@ -41,6 +41,7 @@ const BOT_COMMANDS = [
 	{ command: 'promptgen', description: 'Generate a prompt: /promptgen <goal>' },
 	{ command: 'broadcast', description: 'Draft a WA broadcast: /broadcast <brief>' },
 	{ command: 'send', description: 'Send the last /broadcast draft to your WhatsApp group' },
+	{ command: 'confirm', description: 'Confirm the last low-confidence /schedule event' },
 	{ command: 'todo', description: '/todo <item>, /todo list, /todo done <n>' },
 	{ command: 'models', description: 'List available models for overrides' },
 	{ command: 'help', description: 'Show available commands' },
@@ -332,6 +333,10 @@ async function handleNews(chatId, rawTopic) {
 	}
 }
 
+// Holds a low-confidence parsed event awaiting /confirm, per chat — mirrors
+// lastBroadcastDraft/{/broadcast,/send}. Cleared once confirmed.
+const pendingSchedule = new Map();
+
 async function handleSchedule(chatId, rawText) {
 	if (!rawText) {
 		await telegram.sendMessage(chatId, 'Usage: /schedule &lt;event, e.g. "meeting with tax team tomorrow 2pm at room 305&quot;&gt;');
@@ -346,12 +351,21 @@ async function handleSchedule(chatId, rawText) {
 		const ics = schedule.buildIcs(event);
 		const uid = (ics.match(/^UID:(.+)$/m) || [])[1];
 
-		let calendarLine = '';
-		try {
-			await radicale.pushEvent(uid, ics);
-			calendarLine = '\n\n✅ Added to your calendar.';
-		} catch (err) {
-			calendarLine = `\n\n⚠️ Couldn't add to your calendar (${escapeHtml(err.message)}) — use the file below instead.`;
+		// A date/time the model itself flagged as uncertain must not be
+		// pushed to the calendar automatically — "Jumat depan" used to be a
+		// coin flip with no way to catch a wrong guess before it landed on
+		// the calendar (docs/ANALYSIS.md bug #15).
+		let calendarLine;
+		if (event.confidence < schedule.CONFIRM_BELOW_CONFIDENCE) {
+			pendingSchedule.set(chatId, { uid, ics, event });
+			calendarLine = `\n\n⚠️ Not fully sure about this date/time (confidence ${Math.round(event.confidence * 100)}%) — not added to your calendar yet. Reply /confirm to add it, or ignore and use the file below.`;
+		} else {
+			try {
+				await radicale.pushEvent(uid, ics);
+				calendarLine = '\n\n✅ Added to your calendar.';
+			} catch (err) {
+				calendarLine = `\n\n⚠️ Couldn't add to your calendar (${escapeHtml(err.message)}) — use the file below instead.`;
+			}
 		}
 
 		const filename = `${event.title.replace(/[^\w-]+/g, '_').slice(0, 40) || 'event'}.ics`;
@@ -365,6 +379,21 @@ async function handleSchedule(chatId, rawText) {
 		await telegram.sendMessage(chatId, `Scheduling failed: ${escapeHtml(err.message)}`);
 	} finally {
 		stopTyping();
+	}
+}
+
+async function handleScheduleConfirm(chatId) {
+	const pending = pendingSchedule.get(chatId);
+	if (!pending) {
+		await telegram.sendMessage(chatId, 'No pending event to confirm. Use /schedule first.');
+		return;
+	}
+	try {
+		await radicale.pushEvent(pending.uid, pending.ics);
+		pendingSchedule.delete(chatId);
+		await telegram.sendMessage(chatId, `✅ Added <b>${escapeHtml(pending.event.title)}</b> to your calendar.`);
+	} catch (err) {
+		await telegram.sendMessage(chatId, `Couldn't add to your calendar: ${escapeHtml(err.message)}`);
 	}
 }
 
@@ -390,8 +419,12 @@ async function handleDoc(chatId, argText) {
 	startTyping(chatId);
 	try {
 		const { outputPath, title, usedTemplate } = await docgen.generateWordDoc({ templateName, brief });
-		await telegram.sendMessage(
+		// Saved to OneDrive already; also send it back so it's usable right
+		// away without switching devices (docs/ANALYSIS.md bug #12).
+		await telegram.sendDocument(
 			chatId,
+			fs.readFileSync(outputPath),
+			path.basename(outputPath),
 			`💾 <b>${escapeHtml(title)}</b>\nSaved to OneDrive: Bot Output\\${escapeHtml(path.basename(outputPath))}${usedTemplate ? '' : '\n(no matching template found — used default layout)'}`,
 		);
 	} catch (err) {
@@ -414,8 +447,12 @@ async function handleExcel(chatId, argText) {
 	startTyping(chatId);
 	try {
 		const { outputPath, title, usedTemplate } = await docgen.generateExcelDoc({ templateName, brief });
-		await telegram.sendMessage(
+		// Saved to OneDrive already; also send it back so it's usable right
+		// away without switching devices (docs/ANALYSIS.md bug #12).
+		await telegram.sendDocument(
 			chatId,
+			fs.readFileSync(outputPath),
+			path.basename(outputPath),
 			`💾 <b>${escapeHtml(title)}</b>\nSaved to OneDrive: Bot Output\\${escapeHtml(path.basename(outputPath))}${usedTemplate ? '' : '\n(no matching template found — created a new sheet)'}`,
 		);
 	} catch (err) {
@@ -486,15 +523,20 @@ async function handleBanner(chatId, rawKeyword) {
 	startTyping(chatId);
 	try {
 		const query = await images.refineKeyword(keyword, model.chat);
-		const photos = await images.searchImages(query, { perPage: 6 });
+		// sendMediaGroup requires 2-10 items and errors on anything else
+		// (docs/ANALYSIS.md bug #6) — a single result needs sendPhoto instead.
+		const photos = (await images.searchImages(query, { perPage: 6 })).slice(0, 10);
+		const caption = `🎨 Search: <b>${escapeHtml(query)}</b>`;
 		if (photos.length === 0) {
 			await telegram.sendMessage(chatId, `No images found for "${escapeHtml(query)}".`);
-			return;
+		} else if (photos.length === 1) {
+			await telegram.sendPhoto(chatId, photos[0].imageUrl, caption);
+		} else {
+			await telegram.sendMediaGroup(
+				chatId,
+				photos.map((p, i) => (i === 0 ? { url: p.imageUrl, caption } : { url: p.imageUrl })),
+			);
 		}
-		await telegram.sendMediaGroup(
-			chatId,
-			photos.map((p, i) => (i === 0 ? { url: p.imageUrl, caption: `🎨 Search: <b>${escapeHtml(query)}</b>` } : { url: p.imageUrl })),
-		);
 	} catch (err) {
 		await telegram.sendMessage(chatId, `Banner search failed: ${escapeHtml(err.message)}`);
 	} finally {
@@ -538,19 +580,19 @@ async function handlePdf(chatId, rawInput) {
 			return null;
 		});
 
-		const excerpt = text.slice(0, 6000);
-		const filePath = knowledge.writeSourceCapture({
+		const { filePath, sidecarPath } = knowledge.writeSourceCapture({
 			title,
 			sourceUrl: finalUrl,
 			tags: [],
-			extractedText: excerpt,
+			extractedText: text, // the full text — writeSourceCapture sidecars it to .txt itself if it's large
 			summary,
 			notes: '',
 		});
-		const summaryLine = summary ? `\n\n${summary}` : '\n\n(summary failed — full text still saved)';
+		const summaryLine = summary ? `\n\n${summary}` : '\n\n(summary failed, but the full text was still saved)';
+		const sidecarLine = sidecarPath ? `\n📄 Full text: external-sources/${path.basename(sidecarPath)}` : '';
 		await telegram.sendMessage(
 			chatId,
-			`💾 Captured "${escapeHtml(title)}" to external-sources/${path.basename(filePath)}${escapeHtml(summaryLine)}`,
+			`💾 Captured "${escapeHtml(title)}" to external-sources/${path.basename(filePath)}${sidecarLine}${escapeHtml(summaryLine)}`,
 		);
 	} catch (err) {
 		await telegram.sendMessage(chatId, `PDF capture failed: ${escapeHtml(err.message)}`);
@@ -627,6 +669,7 @@ const HELP_TEXT = [
 	'/summarize &lt;text&gt; — summarize pasted text, or /summarize note &lt;n&gt; for a vault entry',
 	'/news &lt;topic&gt; — recent news digest',
 	'/schedule &lt;event text&gt; — generate a .ics calendar file',
+	'/confirm — confirm the last /schedule event when its date/time was uncertain',
 	'/doc &lt;template or &quot;default&quot;&gt; | &lt;brief&gt; — draft a Word doc into OneDrive',
 	'/excel &lt;template or &quot;default&quot;&gt; | &lt;brief&gt; — draft an Excel table into OneDrive',
 	'/templates — list your Word/Excel templates and the placeholders each one fills',
@@ -751,6 +794,10 @@ async function handleMessage(message) {
 	}
 	if (text === '/send') {
 		enqueue(() => handleSend(chatId));
+		return;
+	}
+	if (text === '/confirm') {
+		enqueue(() => handleScheduleConfirm(chatId));
 		return;
 	}
 	if (text.startsWith('/todo')) {
