@@ -74,6 +74,7 @@ const BOT_COMMANDS = [
 	{ command: 'promptgen', description: '💡 Buat prompt AI: /promptgen <tujuan>' },
 	{ command: 'broadcast', description: '📢 Draft broadcast WA: /broadcast <ringkasan>' },
 	{ command: 'todo', description: '☑️ Daftar tugas: /todo <item>, /todo list' },
+	{ command: 'inbox', description: '📬 Cek inbox sekarang: /inbox atau /inbox <jam>' },
 	{ command: 'spend', description: '💸 Catat transaksi: /spend <deskripsi + jumlah>' },
 	{ command: 'report', description: '📊 Laporan keuangan: /report atau /report YYYY-MM' },
 	{ command: 'remind', description: '🔔 Pengingat: /remind <teks>, list, done <n>, del <n>, check' },
@@ -759,6 +760,32 @@ async function runInboxDigest({ overrideHours } = {}) {
 	return { sent: true, count: messages.length, errors };
 }
 
+// /inbox [<n>h] — runs the same pipeline as the 07:30 scheduled digest, on
+// demand. Unlike the scheduled run, a manual check always replies: "quiet
+// when nothing new" is specifically for not spamming an unattended job,
+// not for leaving a person who just asked hanging with no response at all.
+async function handleInbox(chatId, argText) {
+	let overrideHours;
+	if (argText) {
+		const match = argText.match(/^(\d+)\s*h?$/i);
+		if (!match) {
+			await ui.send(chatId, 'Usage: /inbox atau /inbox &lt;jam&gt;, mis. /inbox 72h (lihat mail sejak N jam lalu)');
+			return;
+		}
+		overrideHours = Number(match[1]);
+	}
+	const job = await ui.progress(chatId, '⏳ Mengecek inbox...');
+	startTyping(chatId);
+	try {
+		const result = await runInboxDigest({ overrideHours });
+		await job.finish(result.sent ? '✅ Selesai.' : 'Tidak ada email baru.');
+	} catch (err) {
+		await job.finish(`Gagal mengecek inbox: ${escapeHtml(err.message)}`);
+	} finally {
+		stopTyping();
+	}
+}
+
 // Voice note -> Groq Whisper -> handled exactly like typed text (an idea or
 // a command — docs/V2-SPEC.md §1). The transcript is shown first so a
 // misheard word is visible before it's acted on.
@@ -1295,7 +1322,7 @@ async function handleStart(chatId) {
 				items: ['Ketik apa saja untuk disimpan sebagai ide', '/list, /search, /get — buka catatan', '/pdf — simpan PDF', '/summarize — ringkas teks/catatan'],
 			},
 			{ label: '🗓 Jadwal & dokumen', items: ['/schedule — tambah ke kalender', '/doc, /excel — buat dokumen', '/templates — lihat template'] },
-			{ label: '💸 Keuangan', items: ['/spend — catat transaksi (teks atau foto struk)', '/report — laporan bulanan'] },
+			{ label: '📬 Email & keuangan', items: ['/inbox — cek email sekarang', '/spend — catat transaksi (teks atau foto struk)', '/report — laporan bulanan'] },
 			{ label: '🔔 Pengingat', items: ['/remind — tambah pengingat berulang', '/remind list, done, del, check'] },
 			{ label: '🧮 Lainnya', items: ['/calc — hitung (teks atau foto)', '/news, /regcheck, /banner', '/broadcast, /todo, /grammar, /promptgen'] },
 		],
@@ -1329,6 +1356,7 @@ const HELP_TEXT = [
 	'/templates — list your Word/Excel templates and the placeholders each one fills',
 	'/regcheck — check now for new Kemenkeu regulations (auto-checked daily at 07:00 WIB)',
 	'/banner &lt;keyword&gt; — sample stock images for a banner/design idea',
+	'/inbox or /inbox &lt;hours&gt; — check the inbox now instead of waiting for the 07:30 WIB digest, e.g. /inbox 72h to look back further',
 	'/spend &lt;description + amount&gt; — log a transaction (or send a receipt photo), pick a category, confirm',
 	'/report or /report YYYY-MM — income/expense/net for a month (auto-sent on the 1st at 08:00 WIB for the previous month)',
 	'/remind &lt;text&gt; — add a recurring reminder; /remind list, done &lt;n&gt;, del &lt;n&gt;, check (checked automatically daily at 07:15 WIB)',
@@ -1589,6 +1617,10 @@ function routeText(chatId, text) {
 	}
 	if (text.startsWith('/banner')) {
 		enqueue(() => handleBanner(chatId, text.slice('/banner'.length).trim()));
+		return;
+	}
+	if (text.startsWith('/inbox')) {
+		enqueue(() => handleInbox(chatId, text.slice('/inbox'.length).trim()));
 		return;
 	}
 	if (text.startsWith('/spend')) {

@@ -30,6 +30,7 @@ commands. Single-user, plain Node, no build step (see `CLAUDE.md`).
 | `/promptgen <goal>` | Generate a ready-to-use AI prompt |
 | `/broadcast <brief>` | Draft a WhatsApp broadcast, then use the buttons to send or redraft |
 | `/todo <item>` / `/todo list` / `/todo done <n>` | Quick to-do list, with ✅ buttons |
+| `/inbox` / `/inbox <hours>` | Check the inbox now (instead of waiting for the 07:30 WIB digest); `/inbox 72h` widens the lookback |
 | `/spend <description + amount>` | Log a transaction (or send a receipt photo captioned `/spend`) — confirm card + category keypad, unless `SPEND_CONFIRM=0` |
 | `/report` / `/report YYYY-MM` | Income/expense/net, category breakdown, top merchants, delta vs. previous month (also sent automatically, see below) |
 | `/remind <text>` | Add a recurring reminder (e.g. "bayar listrik setiap tanggal 20, ingatkan 3 hari sebelumnya") |

@@ -12,8 +12,13 @@ process.env.STATE_DIR = path.join(tmpRoot, '.state');
 const telegram = require('../lib/telegram');
 const events = [];
 telegram.sendMessage = async (chatId, text, extra) => {
-	events.push({ type: 'send', chatId, text, extra });
-	return { message_id: events.length };
+	const message_id = events.length + 1;
+	events.push({ type: 'send', chatId, text, extra, message_id });
+	return { message_id };
+};
+telegram.editMessageText = async (chatId, messageId, text, extra) => {
+	events.push({ type: 'edit', chatId, text, extra, message_id: messageId });
+	return { message_id: messageId };
 };
 telegram.sendChatAction = async () => {};
 telegram.setMyCommands = async () => {};
@@ -25,7 +30,10 @@ for (const key of Object.keys(models.MODELS)) {
 
 const mail = require('../lib/mail');
 const { allowedChatId } = require('../lib/config');
-const { runInboxDigest } = require('../bridge');
+const { runInboxDigest, handleMessage } = require('../bridge');
+
+const msg = (text) => ({ chat: { id: allowedChatId }, text });
+const tick = () => new Promise((r) => setTimeout(r, 80));
 
 test.after(() => {
 	fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -109,4 +117,55 @@ test('runInboxDigest: a provider erroring alongside real new mail still shows bo
 	const last = events.at(-1);
 	assert.match(last.text, /gmail/);
 	assert.match(last.text, /HTTP 401/);
+});
+
+// --- /inbox command: same pipeline, but always replies (docs/V2-SPEC.md §9's
+// first-run checklist explicitly drives this via /inbox 48h) ---
+
+test('/inbox with no argument reports "nothing new" instead of staying silent — a manual check must always reply', async (t) => {
+	events.length = 0;
+	t.mock.method(mail, 'fetchNew', async () => ({ messages: [], errors: [] }));
+
+	await handleMessage(msg('/inbox'));
+	await tick();
+
+	assert.match(events.at(-1).text, /Tidak ada email baru/);
+});
+
+test('/inbox <n>h passes overrideHours through to mail.fetchNew', async (t) => {
+	events.length = 0;
+	let seenOverride;
+	t.mock.method(mail, 'fetchNew', async ({ overrideHours }) => {
+		seenOverride = overrideHours;
+		return { messages: [], errors: [] };
+	});
+
+	await handleMessage(msg('/inbox 48h'));
+	await tick();
+
+	assert.strictEqual(seenOverride, 48);
+});
+
+test('/inbox with real new mail edits the progress placeholder to done, with the digest card sent separately', async (t) => {
+	events.length = 0;
+	const officeMsg = baseMsg({ id: 'office2', subject: 'Info kantor lagi' });
+	t.mock.method(mail, 'fetchNew', async () => ({ messages: [officeMsg], errors: [] }));
+
+	await handleMessage(msg('/inbox'));
+	await tick();
+
+	assert.ok(events.some((e) => e.type === 'edit' && e.text === '✅ Selesai.'));
+	assert.ok(events.some((e) => e.text && e.text.includes('Inbox digest')), 'the actual digest card should have been sent too');
+});
+
+test('/inbox with a malformed argument shows usage instead of throwing', async (t) => {
+	events.length = 0;
+	t.mock.method(mail, 'fetchNew', async () => {
+		throw new Error('must not even attempt to fetch on a bad argument');
+	});
+
+	await handleMessage(msg('/inbox tomorrow'));
+	await tick();
+
+	assert.match(events.at(-1).text, /Usage: \/inbox/);
 });
