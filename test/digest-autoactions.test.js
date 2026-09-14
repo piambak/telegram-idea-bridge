@@ -3,6 +3,7 @@ const assert = require('node:assert');
 
 const digest = require('../lib/digest');
 const { env } = require('../lib/config');
+const sheets = require('../lib/google/sheets');
 
 function meetingItem(overrides = {}) {
 	return {
@@ -41,6 +42,17 @@ function financeItem(overrides = {}) {
 	};
 }
 
+// beforeEach, not just afterEach: a real deployment .env can legitimately
+// have FINANCE_AUTO_LOG=1/DIGEST_AUTO_CALENDAR=1 set, and afterEach alone
+// only cleans up *between* tests — the very first test in the file would
+// still see the real machine's actual flag value at start, silently
+// changing what "unset" tests are actually asserting (or, worse, letting a
+// "falls back to the real finance.logTransaction" test hit real Google
+// Sheets on a machine that has real credentials configured).
+test.beforeEach(() => {
+	delete env.FINANCE_AUTO_LOG;
+	delete env.DIGEST_AUTO_CALENDAR;
+});
 test.afterEach(() => {
 	delete env.FINANCE_AUTO_LOG;
 	delete env.DIGEST_AUTO_CALENDAR;
@@ -111,8 +123,16 @@ test('autoActions: FINANCE_AUTO_LOG=1 calls the injected logTransaction and mark
 	assert.strictEqual(seenItem.amount, 45000, 'the bare Transaction is passed, not the triage wrapper');
 });
 
-test('autoActions: FINANCE_AUTO_LOG=1 with no logTransaction injected falls back to the real finance.logTransaction, which degrades to autoLogError (not thrown) when Sheets isn\'t configured', async () => {
+test('autoActions: FINANCE_AUTO_LOG=1 with no logTransaction injected falls back to the real finance.logTransaction, which degrades to autoLogError (not thrown) when Sheets isn\'t configured', async (t) => {
 	env.FINANCE_AUTO_LOG = '1';
+	// Simulates "not configured" explicitly — must never depend on the real
+	// env actually lacking FINANCE_SHEET_ID/a Google token, which on a real
+	// deployment box (unlike a clean dev sandbox) it usually doesn't. Without
+	// this mock, this test would silently write a fake row to the real
+	// Finance sheet instead of testing the error path at all.
+	t.mock.method(sheets, 'readMonthRows', async () => {
+		throw new Error('Not configured — set FINANCE_SHEET_ID');
+	});
 	const [item] = await digest.autoActions([financeItem()]);
 	assert.strictEqual(item.autoLogged, undefined);
 	assert.ok(item.autoLogError);
