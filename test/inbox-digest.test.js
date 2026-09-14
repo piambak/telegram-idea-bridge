@@ -32,6 +32,19 @@ const mail = require('../lib/mail');
 const { allowedChatId } = require('../lib/config');
 const { runInboxDigest, handleMessage } = require('../bridge');
 
+// runInboxDigest() -> digest.autoActions() falls back to the REAL
+// finance.logTransaction/radicale.pushEvent when no logTransaction/pushEvent
+// is injected (there's no way to inject one from out here — autoActions'
+// defaults are internal to bridge.js's call site). A real deployment .env
+// legitimately has FINANCE_AUTO_LOG=1 and DIGEST_AUTO_CALENDAR=1 set, so
+// without these stubs this file would write fake rows to the real Finance
+// sheet and attempt real PUTs to the real Radicale server on every run.
+const sheets = require('../lib/google/sheets');
+sheets.readMonthRows = async () => [];
+sheets.appendTransaction = async () => {};
+const radicale = require('../lib/radicale');
+radicale.pushEvent = async () => {};
+
 const msg = (text) => ({ chat: { id: allowedChatId }, text });
 const tick = () => new Promise((r) => setTimeout(r, 80));
 
