@@ -26,7 +26,17 @@ function financeItem(overrides = {}) {
 		due: null,
 		priority: 'medium',
 		event: null,
-		finance: { amount: 45000, type: 'out', account: null },
+		transaction: {
+			date: '2026-09-14T00:00:00.000Z',
+			description: 'Pembayaran',
+			category: 'Lainnya',
+			amount: 45000,
+			type: 'out',
+			account: null,
+			source: 'email',
+			ref: 'm2',
+			note: '',
+		},
 		...overrides,
 	};
 }
@@ -98,10 +108,10 @@ test('autoActions: FINANCE_AUTO_LOG=1 calls the injected logTransaction and mark
 	};
 	const [item] = await digest.autoActions([financeItem()], { logTransaction });
 	assert.strictEqual(item.autoLogged, true);
-	assert.strictEqual(seenItem.finance.amount, 45000);
+	assert.strictEqual(seenItem.amount, 45000, 'the bare Transaction is passed, not the triage wrapper');
 });
 
-test('autoActions: FINANCE_AUTO_LOG=1 with no logTransaction wired (finance ledger not built yet) degrades to autoLogError, never throws', async () => {
+test('autoActions: FINANCE_AUTO_LOG=1 with no logTransaction injected falls back to the real finance.logTransaction, which degrades to autoLogError (not thrown) when Sheets isn\'t configured', async () => {
 	env.FINANCE_AUTO_LOG = '1';
 	const [item] = await digest.autoActions([financeItem()]);
 	assert.strictEqual(item.autoLogged, undefined);

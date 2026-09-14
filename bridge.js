@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { allowedChatId, knowledgeBaseDir } = require('./lib/config');
+const { allowedChatId, knowledgeBaseDir, env } = require('./lib/config');
 const telegram = require('./lib/telegram');
 const knowledge = require('./lib/knowledge');
 const pdf = require('./lib/pdf');
@@ -22,6 +22,7 @@ const claude = require('./lib/claude');
 const ui = require('./lib/ui');
 const pending = require('./lib/pending');
 const voice = require('./lib/voice');
+const finance = require('./lib/finance');
 const os = require('os');
 const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./lib/models');
 
@@ -50,6 +51,8 @@ const BOT_COMMANDS = [
 	{ command: 'promptgen', description: '💡 Buat prompt AI: /promptgen <tujuan>' },
 	{ command: 'broadcast', description: '📢 Draft broadcast WA: /broadcast <ringkasan>' },
 	{ command: 'todo', description: '☑️ Daftar tugas: /todo <item>, /todo list' },
+	{ command: 'spend', description: '💸 Catat transaksi: /spend <deskripsi + jumlah>' },
+	{ command: 'report', description: '📊 Laporan keuangan: /report atau /report YYYY-MM' },
 	{ command: 'models', description: '🤖 Daftar model AI yang tersedia' },
 	{ command: 'help', description: '❓ Daftar lengkap perintah' },
 ];
@@ -355,28 +358,194 @@ async function handlePhotoCalcButton(chatId, messageId, entry) {
 	}
 }
 
-// [💸 Catat struk] — reads the receipt via the receipt-vision skill (Gemini
-// Flash vision) and shows what it found. There is no finance ledger in this
-// codebase yet (docs/V2-SPEC.md §3 is a separate, later round), so this
-// reads and displays the receipt rather than pretending to log it anywhere.
+// ---- Finance: /spend, receipt photos, confirm card + keypad, /report ----
+// (docs/V2-SPEC.md §3)
+
+// SPEND_CONFIRM=0 skips the confirm card and logs immediately; everyone
+// else sees [💾 Simpan][🗑 Batal] plus the 11-category keypad first.
+// FINANCE_AUTO_LOG (bank-email auto-logging) is read directly by
+// lib/digest.js's autoActions() — this only concerns the interactive paths.
+function spendConfirmEnabled() {
+	return env.SPEND_CONFIRM !== '0';
+}
+
+function formatRupiah(n) {
+	return `Rp ${Math.round(n).toLocaleString('id-ID')}`;
+}
+
+function spendCardHtml(txn, { saved } = {}) {
+	return ui.card({
+		icon: '💸',
+		title: txn.description,
+		subtitle: `${txn.category} · ${txn.type === 'in' ? 'Masuk' : 'Keluar'}`,
+		body: txn.note || undefined,
+		footer: saved ? `✅ Dicatat — ${formatRupiah(txn.amount)}` : formatRupiah(txn.amount),
+	});
+}
+
+const SPEND_CATEGORY_ROWS = [
+	['Makan', 'Transport', 'Belanja'],
+	['Tagihan', 'Kesehatan', 'Hiburan'],
+	['Pendidikan', 'Transfer', 'Pemasukan'],
+	['Investasi', 'Lainnya'],
+];
+
+function spendKeyboard(id) {
+	const rows = [[{ text: '💾 Simpan', callback_data: `spendsave:${id}` }, { text: '🗑 Batal', callback_data: `spenddiscard:${id}` }]];
+	for (const row of SPEND_CATEGORY_ROWS) rows.push(row.map((cat) => ({ text: cat, callback_data: `spendcat:${id}:${cat}` })));
+	return ui.keyboard(rows);
+}
+
+// Every route into a transaction (/spend text, a receipt photo) ends up
+// here: under SPEND_CONFIRM=0 it's logged immediately, otherwise it's held
+// as a pending draft behind the confirm card + keypad. Returns
+// { html, extra } ready for ui.progress's job.finish() or editMessageText.
+async function resolveSpendPresentation(txn) {
+	if (!spendConfirmEnabled()) {
+		const result = await finance.logTransaction(txn);
+		return { html: spendCardHtml(txn, { saved: result.logged !== false }) };
+	}
+	const id = pending.create('spend', { txn });
+	return { html: spendCardHtml(txn), extra: { reply_markup: spendKeyboard(id) } };
+}
+
+// "/spend makan siang 45rb" -> finance.fromText (regex hint + txn-extract).
+async function handleSpend(chatId, argText) {
+	if (!argText) {
+		await ui.send(chatId, 'Usage: /spend &lt;deskripsi + jumlah&gt;, mis. "makan siang 45rb"');
+		return;
+	}
+	const { modelKey, rest } = parseModelOverride(argText);
+	const model = MODELS[modelKey];
+	const job = await ui.progress(chatId, '⏳ Mencatat transaksi...');
+	startTyping(chatId);
+	try {
+		const txn = await finance.fromText(rest, model.chat);
+		const { html, extra } = await resolveSpendPresentation(txn);
+		await job.finish(html, extra);
+	} catch (err) {
+		await job.finish(`Gagal mencatat transaksi: ${escapeHtml(err.message)}`);
+	} finally {
+		stopTyping();
+	}
+}
+
+// A photo captioned "/spend" — same receipt pipeline as the [💸 Catat
+// struk] button, just reached without the "what's this for?" prompt first
+// since the caption already answers that (docs/V2-SPEC.md §3).
+async function handlePhotoSpend(chatId, fileId) {
+	const job = await ui.progress(chatId, '⏳ Membaca struk...');
+	startTyping(chatId);
+	try {
+		const file = await telegram.getFile(fileId);
+		const buffer = await telegram.downloadFile(file.file_path);
+		const txn = await finance.fromImage(buffer, MODELS.gemini.chat);
+		const { html, extra } = await resolveSpendPresentation(txn);
+		await job.finish(html, extra);
+	} catch (err) {
+		await job.finish(`Gagal membaca struk: ${escapeHtml(err.message)}`);
+	} finally {
+		stopTyping();
+	}
+}
+
+// [💸 Catat struk] — Gemini Flash vision + receipt-vision, via the same
+// finance.fromImage() the tests cover, then the same confirm-card/
+// immediate-save path as /spend.
 async function handlePhotoReceiptButton(chatId, messageId, entry) {
 	await telegram.editMessageText(chatId, messageId, '⏳ Membaca struk...');
 	const file = await telegram.getFile(entry.data.fileId);
 	const buffer = await telegram.downloadFile(file.file_path);
-	const userContent = [
-		{ type: 'text', text: 'Read this receipt and follow the system instructions.' },
-		{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${buffer.toString('base64')}` } },
-	];
-	const data = await skills.runFast('receipt-vision', userContent, MODELS.gemini.chat);
-	const items = (data.items || []).map((it) => `${it.name}: ${it.amount}`);
-	const cardHtml = ui.card({
-		icon: '💸',
-		title: data.merchant || 'Struk',
-		subtitle: data.date || '',
-		sections: items.length ? [{ label: 'Item', items }] : [],
-		footer: `Total: ${data.total ?? '-'}`,
+	const txn = await finance.fromImage(buffer, MODELS.gemini.chat);
+	const { html, extra } = await resolveSpendPresentation(txn);
+	await telegram.editMessageText(chatId, messageId, html, extra);
+}
+
+// [💾 Simpan] — logs the held transaction (ref-based dedup only matters for
+// email-sourced ones, but /spend and receipt drafts share the same call).
+async function handleSpendSave(chatId, messageId, entry) {
+	const result = await finance.logTransaction(entry.data.txn);
+	await telegram.editMessageText(chatId, messageId, spendCardHtml(entry.data.txn, { saved: result.logged !== false }));
+}
+
+// [🗑 Batal] — discards the draft; nothing was ever written to the sheet.
+async function handleSpendDiscard(chatId, messageId) {
+	await telegram.editMessageText(chatId, messageId, '🗑 Dibatalkan.');
+}
+
+// A keypad tap only changes the category and re-renders the same card with
+// the same buttons — the draft stays pending (not removed) until Simpan or
+// Batal, so the user can tap around before committing.
+async function handleSpendCategory(chatId, messageId, entry, category, id) {
+	if (!finance.CATEGORIES.includes(category)) return { removePending: false };
+	const txn = { ...entry.data.txn, category };
+	pending.update(id, { txn });
+	await telegram.editMessageText(chatId, messageId, spendCardHtml(txn), { reply_markup: spendKeyboard(id) });
+	return { removePending: false };
+}
+
+// ---- /report -------------------------------------------------------------
+
+function reportKeyboard(id) {
+	const rows = [];
+	if (env.FINANCE_SHEET_ID) rows.push([{ text: '📄 Buka sheet', url: `https://docs.google.com/spreadsheets/d/${env.FINANCE_SHEET_ID}/edit` }]);
+	rows.push([{ text: '◀️ Bulan sebelumnya', callback_data: `reportprev:${id}` }]);
+	return ui.keyboard(rows);
+}
+
+async function reportCardHtml(monthKey, model) {
+	const report = await finance.generateReport(monthKey);
+	const commentary = await finance.commentaryFor(report, model.chat).catch(() => '');
+	const categoryLines = report.categoryBreakdown.map(
+		(c) => `${c.category}: ${ui.progressBar(c.share)} ${Math.round(c.share * 100)}% (${formatRupiah(c.amount)})`,
+	);
+	const merchantLines = report.topMerchants.map((m) => `${m.merchant}: ${formatRupiah(m.amount)}`);
+	const deltaLine = report.delta
+		? `Δ pengeluaran vs ${report.previousMonthKey}: ${report.delta.expense >= 0 ? '+' : ''}${formatRupiah(report.delta.expense)}`
+		: `Tidak ada data ${report.previousMonthKey} untuk perbandingan`;
+	const body = [commentary, '', `Rata-rata harian: ${formatRupiah(report.dailyAverage)}`, deltaLine].filter((l) => l !== '').join('\n');
+	return ui.card({
+		icon: '📊',
+		title: `Laporan ${monthKey}`,
+		subtitle: `Masuk ${formatRupiah(report.income)} · Keluar ${formatRupiah(report.expense)} · Bersih ${formatRupiah(report.net)}`,
+		body,
+		sections: [
+			...(categoryLines.length ? [{ label: 'Kategori', items: categoryLines }] : []),
+			...(merchantLines.length ? [{ label: 'Top merchant', items: merchantLines }] : []),
+		],
 	});
-	await telegram.editMessageText(chatId, messageId, `${cardHtml}\n\n<i>(belum tersimpan ke catatan keuangan)</i>`);
+}
+
+async function handleReport(chatId, argText) {
+	const trimmed = (argText || '').trim();
+	if (trimmed && !/^\d{4}-\d{2}$/.test(trimmed)) {
+		await ui.send(chatId, 'Usage: /report atau /report YYYY-MM, mis. /report 2026-08');
+		return;
+	}
+	const monthKey = trimmed || new Date().toISOString().slice(0, 7);
+	const model = MODELS[DEFAULT_MODEL];
+	const job = await ui.progress(chatId, '⏳ Menyusun laporan...');
+	startTyping(chatId);
+	try {
+		const html = await reportCardHtml(monthKey, model);
+		const id = pending.create('report', { monthKey });
+		await job.finish(html, { reply_markup: reportKeyboard(id) });
+	} catch (err) {
+		await job.finish(`Gagal menyusun laporan: ${escapeHtml(err.message)}`);
+	} finally {
+		stopTyping();
+	}
+}
+
+// [◀️ Bulan sebelumnya] — regenerates the report for the month before the
+// one currently shown, and re-attaches fresh buttons so it can keep going
+// back arbitrarily far.
+async function handleReportPrevButton(chatId, messageId, entry) {
+	const monthKey = finance.previousMonthKey(entry.data.monthKey);
+	const model = MODELS[DEFAULT_MODEL];
+	const html = await reportCardHtml(monthKey, model);
+	const id = pending.create('report', { monthKey });
+	await telegram.editMessageText(chatId, messageId, html, { reply_markup: reportKeyboard(id) });
 }
 
 // Voice note -> Groq Whisper -> handled exactly like typed text (an idea or
@@ -899,6 +1068,7 @@ async function handleStart(chatId) {
 				items: ['Ketik apa saja untuk disimpan sebagai ide', '/list, /search, /get — buka catatan', '/pdf — simpan PDF', '/summarize — ringkas teks/catatan'],
 			},
 			{ label: '🗓 Jadwal & dokumen', items: ['/schedule — tambah ke kalender', '/doc, /excel — buat dokumen', '/templates — lihat template'] },
+			{ label: '💸 Keuangan', items: ['/spend — catat transaksi (teks atau foto struk)', '/report — laporan bulanan'] },
 			{ label: '🧮 Lainnya', items: ['/calc — hitung (teks atau foto)', '/news, /regcheck, /banner', '/broadcast, /todo, /grammar, /promptgen'] },
 		],
 		footer: '/help untuk daftar lengkap perintah',
@@ -931,6 +1101,8 @@ const HELP_TEXT = [
 	'/templates — list your Word/Excel templates and the placeholders each one fills',
 	'/regcheck — check now for new Kemenkeu regulations (auto-checked daily at 07:00 WIB)',
 	'/banner &lt;keyword&gt; — sample stock images for a banner/design idea',
+	'/spend &lt;description + amount&gt; — log a transaction (or send a receipt photo), pick a category, confirm',
+	'/report or /report YYYY-MM — income/expense/net for a month (auto-sent on the 1st at 08:00 WIB for the previous month)',
 	'/models — list available models and overrides',
 	'/help — this message',
 ].join('\n');
@@ -960,17 +1132,25 @@ const CALLBACK_ACTIONS = {
 	ideadiscard: handleIdeaDiscard,
 	photocalc: handlePhotoCalcButton,
 	photoreceipt: handlePhotoReceiptButton,
+	spendsave: handleSpendSave,
+	spenddiscard: handleSpendDiscard,
+	spendcat: handleSpendCategory,
+	reportprev: handleReportPrevButton,
 };
 
-// callback_data is "<action>:<pendingId>" — a short id, never the payload
+// callback_data is "<action>:<pendingId>" or, for a few actions (the
+// keypad), "<action>:<pendingId>:<extra>" — a short id, never the payload
 // itself (Telegram caps callback_data at 64 bytes; lib/pending.js holds the
-// actual draft/target in .state/pending.json, docs/V2-SPEC.md §1).
+// actual draft/target in .state/pending.json, docs/V2-SPEC.md §1). A
+// handler returning { removePending: false } (the keypad, which needs the
+// draft to survive its own button) keeps the entry instead of the default
+// remove-after-handling.
 async function handleCallbackQuery(cq) {
 	const chatId = cq.message && cq.message.chat && cq.message.chat.id;
 	const messageId = cq.message && cq.message.message_id;
 	if (chatId !== allowedChatId) return;
 
-	const [action, id] = String(cq.data || '').split(':');
+	const [action, id, extra] = String(cq.data || '').split(':');
 	const entry = pending.get(id);
 	if (!entry) {
 		await telegram.answerCallbackQuery(cq.id, { text: 'Tombol ini sudah kedaluwarsa.' }).catch(() => {});
@@ -978,8 +1158,8 @@ async function handleCallbackQuery(cq) {
 	}
 	try {
 		const handler = CALLBACK_ACTIONS[action];
-		if (handler) await handler(chatId, messageId, entry);
-		pending.remove(id);
+		const result = handler ? await handler(chatId, messageId, entry, extra, id) : undefined;
+		if (!result || result.removePending !== false) pending.remove(id);
 		await telegram.answerCallbackQuery(cq.id);
 	} catch (err) {
 		console.error('[bridge] callback query failed:', err.message);
@@ -1007,6 +1187,7 @@ const ARG_PROMPTS = {
 	'/doc': 'Send: &lt;template name or "default"&gt; | &lt;brief&gt;',
 	'/excel': 'Send: &lt;template name or "default"&gt; | &lt;brief&gt;',
 	'/banner': 'Which keyword? e.g. office christmas celebration',
+	'/spend': 'Describe the transaction, e.g. "makan siang 45rb".',
 };
 
 const pendingCommand = new Map();
@@ -1017,13 +1198,19 @@ async function handleMessage(message) {
 
 	if (message.photo && message.photo.length > 0) {
 		const caption = (message.caption || '').trim();
-		if (caption && !caption.startsWith('/calc')) return; // photo for some other purpose, ignore
+		if (caption && !caption.startsWith('/calc') && !caption.startsWith('/spend')) return; // photo for some other purpose, ignore
 		pendingCommand.delete(chatId);
 		const largest = message.photo[message.photo.length - 1];
 		if (!caption) {
 			// No caption at all -> we don't know what it's for; ask
 			// (docs/V2-SPEC.md §1 "New inputs").
 			enqueue(() => handlePhotoPrompt(chatId, largest.file_id));
+			return;
+		}
+		if (caption.startsWith('/spend')) {
+			// A photo captioned /spend skips the "what's this for?" prompt —
+			// the caption already says (docs/V2-SPEC.md §3).
+			enqueue(() => handlePhotoSpend(chatId, largest.file_id));
 			return;
 		}
 		enqueue(() => handleCalcImage(chatId, largest.file_id));
@@ -1168,6 +1355,14 @@ function routeText(chatId, text) {
 		enqueue(() => handleBanner(chatId, text.slice('/banner'.length).trim()));
 		return;
 	}
+	if (text.startsWith('/spend')) {
+		enqueue(() => handleSpend(chatId, text.slice('/spend'.length).trim()));
+		return;
+	}
+	if (text.startsWith('/report')) {
+		enqueue(() => handleReport(chatId, text.slice('/report'.length).trim()));
+		return;
+	}
 	if (text.startsWith('/')) {
 		enqueue(() => ui.send(chatId, `Unknown command. ${HELP_TEXT}`));
 		return;
@@ -1227,6 +1422,23 @@ if (require.main === module) {
 		),
 	);
 	console.log('[bridge] regulation monitor scheduled for 07:00 WIB daily');
+
+	// 1st of the month, 08:00 WIB: auto-send last month's finance report
+	// (docs/V2-SPEC.md §3), same as the /report flow but unprompted.
+	finance.scheduleMonthlyReport(8, () =>
+		enqueue(async () => {
+			const monthKey = finance.previousMonthKey(new Date().toISOString().slice(0, 7));
+			try {
+				const model = MODELS[DEFAULT_MODEL];
+				const html = await reportCardHtml(monthKey, model);
+				const id = pending.create('report', { monthKey });
+				await ui.send(allowedChatId, html, { reply_markup: reportKeyboard(id) });
+			} catch (err) {
+				await ui.send(allowedChatId, `⚠️ <b>Laporan keuangan bulanan gagal dibuat</b>\n\n${escapeHtml(err.message)}`).catch(() => {});
+			}
+		}),
+	);
+	console.log('[bridge] monthly finance report scheduled for the 1st at 08:00 WIB');
 
 	pollLoop();
 }

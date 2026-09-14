@@ -28,18 +28,23 @@ test('rule: an .ics-bearing message is always a meeting, regardless of content',
 	assert.strictEqual(digest.isMeeting(msg), true);
 });
 
-test('rule: a known bank/e-wallet sender domain is finance even with no Rp in the body', () => {
+test('rule: a known bank/e-wallet sender still needs a readable amount — a plain statement notice is not a transaction', () => {
 	const msg = baseMsg({ from: { name: 'BCA', email: 'notifikasi@bca.co.id' }, text: 'Your statement is ready.' });
+	assert.strictEqual(digest.isFinance(msg), false);
+});
+
+test('rule: a known bank/e-wallet sender with a readable amount is finance', () => {
+	const msg = baseMsg({ from: { name: 'BCA', email: 'notifikasi@bca.co.id' }, text: 'Transaksi Rp 50.000 berhasil.' });
 	assert.strictEqual(digest.isFinance(msg), true);
 });
 
-test('rule: "Rp" + a transaction word is finance even from an unknown sender', () => {
+test('rule: a readable Rp amount is finance even from an unknown sender (delegated to lib/finance.js)', () => {
 	const msg = baseMsg({ text: 'Pembayaran Rp 125.000 berhasil diproses.' });
 	assert.strictEqual(digest.isFinance(msg), true);
 });
 
-test('rule: "Rp" alone without a transaction word is NOT finance (avoids over-triggering on any price mention)', () => {
-	const msg = baseMsg({ text: 'Harga produk ini Rp 125.000 di toko kami.' });
+test('rule: no readable amount and not a known finance sender is NOT finance', () => {
+	const msg = baseMsg({ text: 'Just a normal email with no numbers in it.' });
 	assert.strictEqual(digest.isFinance(msg), false);
 });
 
@@ -55,25 +60,9 @@ test('rule: CATEGORY_PROMOTIONS label or unsubscribe/promo wording is newsletter
 	assert.strictEqual(digest.isNewsletter(baseMsg({ text: 'Just a normal email.' })), false);
 });
 
-test('extractFinanceDetails: amount, direction, and account number by regex', () => {
-	const msg = baseMsg({ text: 'Pembayaran Rp 1.250.000,00 dari kartu ****1234 berhasil.' });
-	const details = digest.extractFinanceDetails(msg);
-	assert.strictEqual(details.amount, 1250000);
-	assert.strictEqual(details.type, 'out');
-	assert.strictEqual(details.account, '1234');
-});
-
-test('extractFinanceDetails: recognizes incoming funds wording', () => {
-	const msg = baseMsg({ text: 'Dana masuk Rp 500.000 ke rekening Anda.' });
-	assert.strictEqual(digest.extractFinanceDetails(msg).type, 'in');
-});
-
-test('parseRupiah handles Indonesian (dot-thousands) and occasional US-style (comma-thousands) formatting, rounded to whole Rupiah', () => {
-	assert.strictEqual(digest.parseRupiah('1.250.000'), 1250000);
-	assert.strictEqual(digest.parseRupiah('45.000'), 45000);
-	assert.strictEqual(digest.parseRupiah('1,250,000.00'), 1250000);
-	assert.strictEqual(digest.parseRupiah('1.250.000,50'), 1250001, 'sub-Rupiah amounts round to the nearest whole unit — sen has no real-world use');
-});
+// Amount/direction/account extraction and Rupiah parsing now live in
+// lib/finance.js (see test/finance-amount.test.js and test/finance-email.test.js)
+// — digest.js just delegates to finance.fromEmail, tested above via isFinance.
 
 // --- triage(): rules-first, model for the rest, merged in original order ---
 
@@ -96,7 +85,8 @@ test('triage(): rule-matched messages never reach the model; the rest go to emai
 	assert.strictEqual(results[0].category, 'meeting');
 	assert.strictEqual(results[0].event.title, 'Standup');
 	assert.strictEqual(results[1].category, 'finance');
-	assert.strictEqual(results[1].finance.amount, 10000);
+	assert.strictEqual(results[1].transaction.amount, 10000);
+	assert.strictEqual(results[1].transaction.ref, 'finance', 'ref must be the email id, for dedup on re-run');
 	assert.strictEqual(results[2].category, 'system');
 	assert.strictEqual(results[3].category, 'newsletter');
 	assert.strictEqual(results[4].category, 'action', 'the one message with no rule match should get the model\'s category');

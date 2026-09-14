@@ -214,7 +214,7 @@ test('[🧮 Hitung] on a prompted photo runs the same calc-vision pipeline as /c
 	assert.match(result.text, /<b>42<\/b>/);
 });
 
-test('[💸 Catat struk] on a prompted photo reads the receipt via receipt-vision and shows it, unsaved', async (t) => {
+test('[💸 Catat struk] on a prompted photo reads the receipt via receipt-vision and shows a confirm card + category keypad, not yet saved', async (t) => {
 	fixtureFiles.set('photo-receipt-1', Buffer.from('fake receipt image bytes'));
 	t.mock.method(models.MODELS.gemini, 'chat', async (messages) => {
 		const userContent = messages[1].content;
@@ -238,6 +238,10 @@ test('[💸 Catat struk] on a prompted photo reads the receipt via receipt-visio
 	assert.strictEqual(result.messageId, promptMsg.message_id);
 	assert.match(result.text, /Indomaret/);
 	assert.match(result.text, /Air mineral/);
-	assert.match(result.text, /47500/);
-	assert.match(result.text, /belum tersimpan/i, 'should be honest that this is not saved to a finance ledger');
+	assert.match(result.text, /47\.500/);
+	assert.doesNotMatch(result.text, /✅ Dicatat/, 'not saved yet — the confirm card is shown first');
+	const rows = result.extra.reply_markup.inline_keyboard;
+	assert.match(rows[0][0].callback_data, /^spendsave:/, 'Simpan button');
+	assert.match(rows[0][1].callback_data, /^spenddiscard:/, 'Batal button');
+	assert.ok(rows.slice(1).flat().some((btn) => btn.callback_data.startsWith('spendcat:') && btn.text === 'Makan'), 'category keypad');
 });
