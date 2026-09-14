@@ -188,3 +188,34 @@ test('[✅ Selesai] on a nudge card rolls the reminder forward and completes its
 	const [updated] = state.readJson('reminders.json', []);
 	assert.strictEqual(updated.nextDue, '2026-10-10');
 });
+
+// A dead/revoked Google refresh token used to only be logged server-side,
+// invisible on a headless Scheduled Task run — /remind check (and the
+// scheduled tick it shares its implementation with) must now surface it as
+// a distinct, actionable alert instead of a silent no-op.
+test('/remind check surfaces a distinct "Google token expired" alert when a task creation fails with invalid_grant, instead of silently doing nothing', async (t) => {
+	resetReminders();
+	events.length = 0;
+	t.mock.method(tasks, 'createTask', async () => {
+		const err = new Error('invalid_grant — the token was revoked, or the app was still in Testing when you signed in.');
+		err.code = 'invalid_grant';
+		throw err;
+	});
+	state.writeJson('reminders.json', [
+		{ id: 1, title: 'Bayar listrik', notes: '', rule: 'monthly{20}', leadDays: 3, nextDue: '2026-09-20', lastTaskId: null, lastTaskFor: null, active: true },
+	]);
+
+	const realNow = Date.now;
+	Date.now = () => Date.UTC(2026, 8, 19, 3, 0, 0) - 7 * 3600 * 1000; // within the lead window
+	try {
+		await handleMessage(msg('/remind check'));
+		await tick();
+	} finally {
+		Date.now = realNow;
+	}
+
+	const alert = events.find((e) => e.text && e.text.includes('Google token kadaluarsa'));
+	assert.ok(alert, 'a distinct Google-auth alert should have been sent');
+	assert.match(alert.text, /setup-google\.js/);
+	assert.strictEqual(events.some((e) => e.text && e.text.includes('Bayar listrik') && e.extra && e.extra.reply_markup), false, 'a reminder whose task failed to create must not also get a normal nudge card');
+});

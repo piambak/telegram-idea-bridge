@@ -3,6 +3,7 @@
 // Prints the consent URL, listens on 127.0.0.1:53682 for the redirect,
 // exchanges the code, and writes .google-token.json.
 const http = require('http');
+const cp = require('child_process'); // not destructured — lets tests mock cp.exec
 const { env } = require('./lib/config');
 const auth = require('./lib/google/auth');
 
@@ -48,6 +49,18 @@ function waitForAuthCode({ port = PORT, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
 	});
 }
 
+// Best-effort auto-launch of the consent URL — the whole point is to cut
+// the Testing-mode weekly re-auth (7-day refresh token expiry, see
+// docs/SETUP-GOOGLE.md) down to "run this, click Allow". Never fatal: the
+// URL is always printed too, so a failure here (headless box, no default
+// browser association) just means falling back to the old copy-paste flow.
+function openBrowser(url) {
+	const cmd = process.platform === 'win32' ? `start "" "${url}"` : process.platform === 'darwin' ? `open "${url}"` : `xdg-open "${url}"`;
+	cp.exec(cmd, (err) => {
+		if (err) console.error(`(couldn't auto-open a browser — open the URL above manually: ${err.message})`);
+	});
+}
+
 // Prints the connected Google account's address via a lightweight Gmail
 // profile call — just confirms the token actually works end to end.
 async function fetchConnectedAddress() {
@@ -67,11 +80,13 @@ async function main() {
 		return;
 	}
 
-	console.log('Open this URL in any browser, sign in, and accept:\n');
-	console.log(auth.authUrl());
+	const url = auth.authUrl();
+	console.log('Opening this URL in your default browser — sign in and accept:\n');
+	console.log(url);
 	console.log(`\nListening on http://127.0.0.1:${PORT}/oauth2callback ...`);
-	console.log("If this PC's browser can't reach that address, finish consent on your phone, then paste the final");
+	console.log("If nothing opens, or this PC's browser can't reach that address, finish consent on your phone, then paste the final");
 	console.log(`http://127.0.0.1:${PORT}/oauth2callback?code=... URL into a browser on this PC.\n`);
+	openBrowser(url);
 
 	const code = await waitForAuthCode();
 	await auth.exchangeCode(code);
@@ -81,7 +96,7 @@ async function main() {
 	console.log(`Connected as: ${address}`);
 }
 
-module.exports = { waitForAuthCode, fetchConnectedAddress, main, PORT, DEFAULT_TIMEOUT_MS };
+module.exports = { waitForAuthCode, fetchConnectedAddress, openBrowser, main, PORT, DEFAULT_TIMEOUT_MS };
 
 if (require.main === module) {
 	main().catch((err) => {

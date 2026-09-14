@@ -13,6 +13,7 @@ env.GOOGLE_TOKEN_PATH = tokenFile;
 env.GOOGLE_CLIENT_ID = 'client-id';
 env.GOOGLE_CLIENT_SECRET = 'client-secret';
 
+const cp = require('node:child_process'); // same specifier setup-google.js uses
 const setupGoogle = require('../setup-google');
 
 test.after(() => {
@@ -93,4 +94,30 @@ test('fetchConnectedAddress(): degrades to a friendly message instead of throwin
 	fs.writeFileSync(tokenFile, JSON.stringify({ access_token: 'a1', refresh_token: 'r1', expiry_date: Date.now() + 3600_000 }));
 	t.mock.method(global, 'fetch', async () => ({ ok: false, status: 500, text: async () => 'boom' }));
 	assert.match(await setupGoogle.fetchConnectedAddress(), /check \/status/);
+});
+
+// --- openBrowser() — cuts the weekly Testing-mode re-auth down to "run,
+// click Allow" instead of copy-pasting the URL ---
+
+test('openBrowser(): shells out to the right platform command with the URL', (t) => {
+	const savedPlatform = process.platform;
+	let seenCmd;
+	t.mock.method(cp, 'exec', (cmd, cb) => {
+		seenCmd = cmd;
+		cb(null);
+	});
+	Object.defineProperty(process, 'platform', { value: 'win32' });
+	try {
+		setupGoogle.openBrowser('https://accounts.google.com/o/oauth2/v2/auth?x=1');
+		assert.strictEqual(seenCmd, 'start "" "https://accounts.google.com/o/oauth2/v2/auth?x=1"');
+	} finally {
+		Object.defineProperty(process, 'platform', { value: savedPlatform });
+	}
+});
+
+test('openBrowser(): a failure to launch a browser never throws — the URL was already printed as a fallback', (t) => {
+	t.mock.method(cp, 'exec', (cmd, cb) => {
+		cb(new Error('no browser association'));
+	});
+	assert.doesNotThrow(() => setupGoogle.openBrowser('https://example.com/consent'));
 });

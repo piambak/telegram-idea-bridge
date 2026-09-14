@@ -3,6 +3,23 @@
 The bot reads the office inbox with the **device-code flow**: no secret, no
 redirect URL, works from a headless process. It only needs `Mail.Read`.
 
+## Skipping this entirely
+
+Everything below is optional. If your IT admin isn't reachable to grant
+consent (Path A) and IMAP is also blocked or a free/personal Microsoft
+account gets rejected (Path B), just don't set `MS_CLIENT_ID` — and set:
+
+```
+MAIL_PROVIDERS=gmail
+```
+
+in `.env`. Without this, the digest still tries Outlook every run (the
+default is `gmail,outlook`), fails with "not connected", and shows that as
+a noisy provider error on every digest card. `MAIL_PROVIDERS=gmail` stops it
+from being attempted at all — the inbox digest, finance email detection, and
+everything else keep working off Gmail alone. `/status`'s "Microsoft token"
+row will just read "Not configured", which is expected and fine.
+
 ## Path A — Microsoft Graph (preferred)
 
 1. Sign in to https://portal.azure.com with **any** Microsoft account
@@ -60,8 +77,12 @@ IMAP_MAILBOX=INBOX
 
 ## Choosing providers
 
-`MAIL_PROVIDERS=gmail,outlook` (default tries gmail, outlook, imap and uses
-whichever is connected). `/status` shows each one.
+`MAIL_PROVIDERS` is a comma-separated list; the default is `gmail,outlook`
+(IMAP is opt-in only — add it explicitly if you're using Path B). Every
+listed provider that fails to fetch shows up as a per-provider error on the
+digest card rather than hiding the others; `MAIL_PROVIDERS=gmail` is how you
+drop a provider you're not using instead of seeing that every time. `/status`
+shows each configured provider's connection state.
 
 Nothing is ever written to the mailbox: no labels, no read-state changes, no
 sending.

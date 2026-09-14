@@ -32,6 +32,25 @@ const { MODELS, DEFAULT_MODEL, modelForJob, parseModelOverride } = require('./li
 
 const { escapeHtml } = ui;
 
+// A dead/revoked Google refresh token (Testing-mode's 7-day expiry, most
+// commonly) is a failure mode a scheduled job can't just wait out and
+// retry — every other error might clear up on its own tomorrow, this one
+// needs the user to actually run `node setup-google.js` again. Surfacing it
+// distinctly, instead of folding it into a generic "job failed" message,
+// is the whole point: a headless Scheduled Task run has no other way to
+// tell you this happened.
+function isGoogleAuthError(message) {
+	return /invalid_grant/i.test(String(message || ''));
+}
+
+function googleAuthAlertHtml() {
+	return ui.card({
+		icon: '🔑',
+		title: 'Google token kadaluarsa',
+		body: 'Sambungan Google (Gmail/Sheets/Tasks) terputus — token dicabut atau kadaluarsa (mode Testing: 7 hari). Jalankan <code>node setup-google.js</code> di PC untuk sambungkan ulang.',
+	});
+}
+
 // Emoji + Indonesian descriptions for the Telegram command menu
 // (docs/V2-SPEC.md §1).
 const BOT_COMMANDS = [
@@ -589,12 +608,19 @@ function reminderRuleLabel(rule) {
 // entry: yesterday's button (if any) has its own now-stale one, and a
 // fresh id per send matches the rest of the bot's button convention.
 async function runReminderTick() {
-	const nudges = await reminders.tick();
+	const { nudges, errors } = await reminders.tick();
 	for (const { reminder } of nudges) {
 		const id = pending.create('reminder', { reminderId: reminder.id });
 		await ui.send(allowedChatId, reminderCardHtml(reminder), { reply_markup: reminderKeyboard(id) });
 	}
-	return nudges;
+	if (errors.length > 0) {
+		const authIssue = errors.some((e) => isGoogleAuthError(e.message));
+		const html = authIssue
+			? googleAuthAlertHtml()
+			: ui.card({ icon: '⚠️', title: 'Beberapa pengingat gagal diproses', body: errors.map((e) => `#${e.reminderId}: ${e.message}`).join('\n') });
+		await ui.send(allowedChatId, html);
+	}
+	return { nudges, errors };
 }
 
 // [✅ Selesai] — the same rollover an external (phone) completion gets via
@@ -652,7 +678,7 @@ async function handleRemind(chatId, argText) {
 	if (argText === 'check') {
 		const job = await ui.progress(chatId, '⏳ Mengecek pengingat...');
 		try {
-			const nudges = await runReminderTick();
+			const { nudges } = await runReminderTick();
 			await job.finish(nudges.length === 0 ? 'Tidak ada pengingat yang perlu dikirim hari ini.' : `${nudges.length} pengingat dikirim.`);
 		} catch (err) {
 			await job.finish(`Gagal mengecek pengingat: ${escapeHtml(err.message)}`);
@@ -719,7 +745,10 @@ async function runInboxDigest({ overrideHours } = {}) {
 	const { messages, errors } = await mail.fetchNew({ overrideHours });
 	if (messages.length === 0) {
 		if (errors.length === 0) return { sent: false, count: 0, errors };
-		await ui.send(allowedChatId, ui.card({ icon: '📬', title: 'Inbox digest', footer: errors.map((e) => `⚠️ ${e.provider}: ${e.message}`).join('; ') }));
+		const html = errors.some((e) => isGoogleAuthError(e.message))
+			? googleAuthAlertHtml()
+			: ui.card({ icon: '📬', title: 'Inbox digest', footer: errors.map((e) => `⚠️ ${e.provider}: ${e.message}`).join('; ') });
+		await ui.send(allowedChatId, html);
 		return { sent: true, count: 0, errors };
 	}
 	const model = MODELS[DEFAULT_MODEL];
@@ -1708,7 +1737,10 @@ if (require.main === module) {
 				const id = pending.create('report', { monthKey });
 				await ui.send(allowedChatId, html, { reply_markup: reportKeyboard(id) });
 			} catch (err) {
-				await ui.send(allowedChatId, `⚠️ <b>Laporan keuangan bulanan gagal dibuat</b>\n\n${escapeHtml(err.message)}`).catch(() => {});
+				const html = isGoogleAuthError(err.message)
+					? googleAuthAlertHtml()
+					: `⚠️ <b>Laporan keuangan bulanan gagal dibuat</b>\n\n${escapeHtml(err.message)}`;
+				await ui.send(allowedChatId, html).catch(() => {});
 			}
 		}),
 	);

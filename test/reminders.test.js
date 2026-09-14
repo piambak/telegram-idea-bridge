@@ -85,7 +85,7 @@ test('tick: outside the lead window, no task is created and no nudge is sent', a
 	const realNow = Date.now;
 	Date.now = () => Date.UTC(2026, 8, 14, 3, 0, 0) - 7 * 3600 * 1000; // 2026-09-14 WIB
 	try {
-		const nudges = await reminders.tick();
+		const { nudges } = await reminders.tick();
 		assert.strictEqual(nudges.length, 0);
 	} finally {
 		Date.now = realNow;
@@ -108,11 +108,12 @@ test('tick: inside the lead window, creates a task and nudges exactly once for t
 	const realNow = Date.now;
 	Date.now = () => Date.UTC(2026, 8, 18, 3, 0, 0) - 7 * 3600 * 1000; // 2026-09-18 WIB, 2 days before due
 	try {
-		const nudges = await reminders.tick();
+		const { nudges, errors } = await reminders.tick();
 		assert.strictEqual(createCalls, 1);
 		assert.strictEqual(nudges.length, 1);
 		assert.strictEqual(nudges[0].reminder.id, 1);
 		assert.strictEqual(nudges[0].dueOrOverdue, false);
+		assert.strictEqual(errors.length, 0);
 	} finally {
 		Date.now = realNow;
 	}
@@ -154,20 +155,20 @@ test('tick: due-day and overdue nudges repeat daily without creating a new task'
 	const realNow = Date.now;
 	try {
 		Date.now = () => Date.UTC(2026, 8, 18, 3, 0, 0) - 7 * 3600 * 1000; // lead window: creates + nudges
-		const first = await reminders.tick();
+		const first = (await reminders.tick()).nudges;
 		assert.strictEqual(first.length, 1);
 
 		Date.now = () => Date.UTC(2026, 8, 19, 3, 0, 0) - 7 * 3600 * 1000; // still before due, no repeat
-		const middle = await reminders.tick();
+		const middle = (await reminders.tick()).nudges;
 		assert.strictEqual(middle.length, 0, 'a lead-window nudge does not repeat before the due date');
 
 		Date.now = () => Date.UTC(2026, 8, 20, 3, 0, 0) - 7 * 3600 * 1000; // due day: nudges again
-		const dueDay = await reminders.tick();
+		const dueDay = (await reminders.tick()).nudges;
 		assert.strictEqual(dueDay.length, 1);
 		assert.strictEqual(dueDay[0].dueOrOverdue, true);
 
 		Date.now = () => Date.UTC(2026, 8, 23, 3, 0, 0) - 7 * 3600 * 1000; // overdue: still nudges
-		const overdue = await reminders.tick();
+		const overdue = (await reminders.tick()).nudges;
 		assert.strictEqual(overdue.length, 1);
 		assert.strictEqual(overdue[0].dueOrOverdue, true);
 
@@ -193,12 +194,60 @@ test('tick: external completion (phone) is detected and rolls nextDue forward, r
 	const realNow = Date.now;
 	Date.now = () => Date.UTC(2026, 8, 20, 3, 0, 0) - 7 * 3600 * 1000; // due day
 	try {
-		const nudges = await reminders.tick();
+		const { nudges, errors } = await reminders.tick();
 		assert.strictEqual(nudges.length, 0, 'a just-rolled-forward reminder gets no nudge this run');
+		assert.strictEqual(errors.length, 0);
 		const [updated] = reminders.listReminders();
 		assert.strictEqual(updated.nextDue, '2026-10-20');
 		assert.strictEqual(updated.lastTaskId, null);
 		assert.strictEqual(updated.lastTaskFor, null);
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+// A Google Tasks failure (a dead/revoked refresh token, most importantly)
+// used to only go to console.error, invisible on a headless Scheduled Task.
+// It must come back in tick()'s own result so a caller (bridge.js) can
+// actually alert on it.
+test('tick: a task-creation failure is returned as an error, not silently swallowed', async (t) => {
+	resetState();
+	t.mock.method(tasks, 'createTask', async () => {
+		const err = new Error('invalid_grant — the token was revoked, or the app was still in Testing when you signed in.');
+		err.code = 'invalid_grant';
+		throw err;
+	});
+	seed({ id: 1, title: 'Bayar listrik', notes: '', rule: 'monthly{20}', leadDays: 3, nextDue: '2026-09-20', lastTaskId: null, lastTaskFor: null, active: true });
+
+	const realNow = Date.now;
+	Date.now = () => Date.UTC(2026, 8, 18, 3, 0, 0) - 7 * 3600 * 1000; // inside the lead window
+	try {
+		const { nudges, errors } = await reminders.tick();
+		assert.strictEqual(nudges.length, 0, 'a reminder whose task failed to create gets no (misleading) nudge');
+		assert.strictEqual(errors.length, 1);
+		assert.strictEqual(errors[0].reminderId, 1);
+		assert.strictEqual(errors[0].code, 'invalid_grant');
+		assert.match(errors[0].message, /invalid_grant/);
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+test('tick: a completion-check failure is returned as an error too, and the reminder is left untouched (not wrongly rolled forward)', async (t) => {
+	resetState();
+	t.mock.method(tasks, 'ensureTaskList', async () => {
+		throw new Error('invalid_grant — the token was revoked, or the app was still in Testing when you signed in.');
+	});
+	seed({ id: 1, title: 'Bayar listrik', notes: '', rule: 'monthly{20}', leadDays: 3, nextDue: '2026-09-20', lastTaskId: 'task-1', lastTaskFor: '2026-09-20', active: true });
+
+	const realNow = Date.now;
+	Date.now = () => Date.UTC(2026, 8, 20, 3, 0, 0) - 7 * 3600 * 1000; // due day
+	try {
+		const { errors } = await reminders.tick();
+		assert.strictEqual(errors.length, 1);
+		assert.match(errors[0].message, /invalid_grant/);
+		const [unchanged] = reminders.listReminders();
+		assert.strictEqual(unchanged.nextDue, '2026-09-20', 'must not roll forward on an unconfirmed completion check');
 	} finally {
 		Date.now = realNow;
 	}

@@ -70,6 +70,13 @@ the reason if not. These are real live checks (a minimal chat call, a
 forced token refresh, an actual connection attempt) — not just "is the env
 var set" — so a revoked token or a dead office-PC service shows up here.
 This is the one command to run on the PC to see what's actually configured.
+Skipped-on-purpose services (e.g. Microsoft, if you're not using Outlook)
+are expected to show "Not configured" here — that's not a problem to fix.
+
+You don't have to wait for `/status` to notice a dead Google token, though:
+any scheduled job that hits `invalid_grant` (the Google refresh token died —
+see Setup below) sends a distinct "🔑 Google token kadaluarsa" alert to
+Telegram the moment it happens, instead of failing silently.
 
 ## Setup
 
@@ -105,7 +112,9 @@ GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 
 # Microsoft (Outlook mail via Graph; run `node setup-outlook.js`). See
-# docs/SETUP-OUTLOOK.md.
+# docs/SETUP-OUTLOOK.md. Entirely optional — skip it (leave MS_CLIENT_ID
+# unset) if you can't get IT admin consent or a personal account is
+# rejected; just set MAIL_PROVIDERS=gmail below so it isn't attempted.
 MS_CLIENT_ID=
 MS_TENANT=organizations
 
@@ -116,7 +125,9 @@ IMAP_USER=
 IMAP_PASSWORD=
 IMAP_MAILBOX=INBOX
 
-# Which mail providers the inbox digest pulls from
+# Which mail providers the inbox digest pulls from — default gmail,outlook;
+# a provider that's listed but not connected shows up as a per-run digest
+# error, so drop anything you're not using (e.g. MAIL_PROVIDERS=gmail)
 MAIL_PROVIDERS=gmail,outlook
 
 # Finance ledger (Google Sheets — one spreadsheet, one tab per month)
@@ -150,6 +161,16 @@ is ever committed. `OPENKNOWLEDGE_DIR`, `OBSIDIAN_VAULT_DIR`, `STATE_DIR`,
 `GOOGLE_TOKEN_PATH`, and `MS_TOKEN_PATH` are path overrides most people
 won't need to touch; they exist mainly so the test suite never points at
 real data.
+
+**Google's OAuth consent screen for a personal app (`docs/SETUP-GOOGLE.md`)
+is worth reading before you run `node setup-google.js`.** The short version:
+stay in Testing rather than chasing Google's "Publish → In production"
+verification review (it now demands real domain ownership and a substantive
+privacy policy — not worth it for an app only you sign into). Testing means
+the refresh token expires every 7 days; `node setup-google.js` opens the
+consent URL in your browser automatically, so re-running it weekly is one
+command and one click, and any scheduled job that hits the expiry alerts you
+on Telegram immediately rather than failing quietly.
 
 `/schedule` pushes events to a local [Radicale](https://radicale.org/)
 CalDAV server rather than Google Calendar — no OAuth, no 7-day token
